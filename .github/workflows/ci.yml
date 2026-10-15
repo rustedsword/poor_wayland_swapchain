@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends meson pkgconf libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
+        run: apt-get update && apt-get install -y --no-install-recommends meson pkgconf libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev libvulkan-dev ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
       - name: Fetch subprojects
         run: |
           git -c safe.directory='*' submodule update --init subprojects/poor_wayland subprojects/wayland-protocols
@@ -69,7 +69,7 @@ jobs:
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh ${{ matrix.version }}
-          sudo apt-get install -y libclang-rt-${{ matrix.version }}-dev meson libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
+          sudo apt-get install -y libclang-rt-${{ matrix.version }}-dev meson libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev libvulkan-dev ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
       - name: Fetch subprojects
         run: |
           git submodule update --init subprojects/poor_wayland subprojects/wayland-protocols

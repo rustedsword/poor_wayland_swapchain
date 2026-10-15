@@ -36,3 +36,16 @@ if egl_dep.found() and glesv2_dep.found()
 		dependencies: [ swapchain_dep, egl_dep, glesv2_dep ],
 	)
 endif
+
+vulkan_dep = dependency('vulkan', required: false)
+
+if vulkan_dep.found()
+	executable(
+		'simple-vulkan',
+		'simple-vulkan.c',
+		'example-log.c',
+		xdg_shell_client_protocol_h,
+		xdg_shell_protocol_c,
+		dependencies: [ swapchain_dep, vulkan_dep ],
+	)
+endif
