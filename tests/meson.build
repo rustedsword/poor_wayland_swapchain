@@ -55,7 +55,7 @@ if vulkan_dep.found()
 	validation_check = files('check-validation.py')
 	vulkan_env = [ 'NODEVICE_SELECT=1' ]
 	test('validation-checker', validation_runner, args: files('check_validation_test.py'))
-	vulkan_validation_probe = executable('vulkan-validation-probe', 'vulkan-validation-probe.c', dependencies: vulkan_dep)
+	vulkan_validation_probe = executable('vulkan-validation-probe', 'vulkan-validation-probe.c', dependencies: [ vulkan_dep, poor_base_dep ])
 	test(
 		'validation-reports-errors',
 		validation_runner,
