@@ -73,20 +73,16 @@ static int syncobj_signal(int drm_fd, uint32_t handle, uint64_t point)
 	return drm_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &signal) < 0 ? -errno : 0;
 }
 
-/* A sync_file goes to a timeline point through a binary syncobj */
-static int syncobj_import_fence(struct poor_wl_swapchain *swapchain, uint32_t handle, uint64_t point, int fence)
+static int syncobj_import_fence(int drm_fd, uint32_t handle, uint64_t point, int fence)
 {
 	struct drm_syncobj_handle import = {
-		.handle = swapchain->import_syncobj, .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE, .fd = fence
-	};
-	struct drm_syncobj_transfer transfer = {
-		.src_handle = swapchain->import_syncobj, .dst_handle = handle, .dst_point = point
+		.handle = handle,
+		.flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE | DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE,
+		.fd = fence,
+		.point = point,
 	};
 
-	if (drm_ioctl(swapchain->drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import) < 0 ||
-	    drm_ioctl(swapchain->drm_fd, DRM_IOCTL_SYNCOBJ_TRANSFER, &transfer) < 0)
-		return -errno;
-	return 0;
+	return drm_ioctl(drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import) < 0 ? -errno : 0;
 }
 
 /* Each buffer has its own timeline, since the compositor may release buffers in another order than they came */
@@ -113,14 +109,11 @@ static int buffer_timeline_init(struct poor_wl_swapchain *swapchain, struct poor
 static int buffer_set_points(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, int fence)
 {
 	uint64_t acquire = buffer->point + 1, release = buffer->point + 2;
-	struct drm_syncobj_eventfd wait = { .handle = buffer->syncobj, .point = release, .fd = swapchain->eventfd };
-	int ret = fence >= 0 ? syncobj_import_fence(swapchain, buffer->syncobj, acquire, fence) :
+	int ret = fence >= 0 ? syncobj_import_fence(swapchain->drm_fd, buffer->syncobj, acquire, fence) :
 			       syncobj_signal(swapchain->drm_fd, buffer->syncobj, acquire);
 
 	if (ret < 0)
 		return ret;
-	if (drm_ioctl(swapchain->drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &wait) < 0)
-		return -errno;
 	buffer->point = release;
 	poor_wp_linux_drm_syncobj_surface_v1_set_acquire_point(&swapchain->syncobj_surface, &buffer->timeline, acquire >> 32,
 								 acquire & 0xffffffff);
@@ -139,7 +132,24 @@ static void buffer_free(struct poor_wl_swapchain_buffer *buffer)
 		syncobj_destroy(swapchain->drm_fd, buffer->syncobj);
 	}
 	buffer->allocator->free(buffer->allocator_data, buffer);
-	buffer->allocated = buffer->busy = buffer->stale = false;
+	buffer->allocated = buffer->busy = buffer->stale = buffer->waiting = false;
+}
+
+/* The eventfd counts the release points that signal */
+static void swapchain_wait_releases(struct poor_wl_swapchain *swapchain)
+{
+	for (unsigned i = 0; i < POOR_WL_SWAPCHAIN_BUFFERS; i++) {
+		struct poor_wl_swapchain_buffer *buffer = &swapchain->buffers[i];
+		struct drm_syncobj_eventfd wait = { .handle = buffer->syncobj, .point = buffer->point, .fd = swapchain->eventfd };
+
+		if (!buffer->allocated || !buffer->busy || buffer->waiting)
+			continue;
+		if (drm_ioctl(swapchain->drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &wait) < 0) {
+			swapchain_fail(swapchain, errno);
+			return;
+		}
+		buffer->waiting = true;
+	}
 }
 
 /* A buffer that the compositor or the caller still uses goes once they are done with it */
@@ -155,6 +165,8 @@ static void swapchain_drop_buffers(struct poor_wl_swapchain *swapchain)
 		else
 			buffer_free(buffer);
 	}
+	if (swapchain->syncobj_manager)
+		swapchain_wait_releases(swapchain);
 }
 
 static void swapchain_render(struct poor_wl_swapchain *swapchain);
@@ -179,7 +191,7 @@ static void swapchain_read_releases(struct poor_wl_swapchain *swapchain)
 			   swapchain->eventfd, &swapchain->released, sizeof(swapchain->released), -1);
 }
 
-/* The eventfd counts signaled release points, the timelines tell whose they are */
+/* The timelines tell which buffers the compositor is done with */
 static void swapchain_check_releases(struct poor_wl_swapchain *swapchain)
 {
 	struct poor_wl_swapchain_buffer *busy[POOR_WL_SWAPCHAIN_BUFFERS];
@@ -202,11 +214,10 @@ static void swapchain_check_releases(struct poor_wl_swapchain *swapchain)
 	for (unsigned i = 0; i < query.count_handles; i++) {
 		if (points[i] < busy[i]->point)
 			continue;
-		busy[i]->busy = false;
+		busy[i]->busy = busy[i]->waiting = false;
 		if (busy[i]->stale)
 			buffer_free(busy[i]);
 	}
-	swapchain_render(swapchain);
 }
 
 POOR_LOOP_GROUP_OP(swapchain_on_release, loop, io, op, cqe)
@@ -221,6 +232,7 @@ POOR_LOOP_GROUP_OP(swapchain_on_release, loop, io, op, cqe)
 	}
 	swapchain_read_releases(swapchain);
 	swapchain_check_releases(swapchain);
+	swapchain_render(swapchain);
 }
 
 POOR_LOOP_GROUP_TIMER(swapchain_on_timer, loop, io, timer)
@@ -286,7 +298,7 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 	poor_zwp_linux_buffer_params_v1_destroy(&swapchain->params);
 	poor_wl_buffer_add_listener(&buffer->buffer, &buffer_listener, buffer);
 	buffer->allocated = true;
-	buffer->busy = buffer->stale = false;
+	buffer->busy = buffer->stale = buffer->waiting = false;
 	return 0;
 }
 
@@ -305,7 +317,11 @@ static struct poor_wl_swapchain_buffer *swapchain_free_buffer(struct poor_wl_swa
 	return unallocated;
 }
 
-/* The caller renders once the compositor wants a frame and a buffer is free, after the feedback came */
+/*
+ * The caller renders once the compositor wants a frame and a buffer is free, after the feedback came. With explicit
+ * synchronization the release points are checked only before a new buffer would be needed, and waited for if none
+ * has signaled yet.
+ */
 static void swapchain_render(struct poor_wl_swapchain *swapchain)
 {
 	struct poor_wl_swapchain_buffer *buffer;
@@ -315,7 +331,13 @@ static void swapchain_render(struct poor_wl_swapchain *swapchain)
 	    !swapchain->tranche_count || !swapchain->allocator || !swapchain->width || !swapchain->height)
 		return;
 	buffer = swapchain_free_buffer(swapchain);
-	if (!buffer)
+	if (swapchain->syncobj_manager && (!buffer || !buffer->allocated)) {
+		swapchain_check_releases(swapchain);
+		buffer = swapchain_free_buffer(swapchain);
+		if (!buffer)
+			swapchain_wait_releases(swapchain);
+	}
+	if (!buffer || swapchain->failed)
 		return;
 	if (!buffer->allocated && (ret = buffer_allocate(swapchain, buffer)) < 0) {
 		swapchain_fail(swapchain, -ret);
@@ -495,17 +517,18 @@ POOR_WL_EXPORT void poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, 
 	for (unsigned i = 0; i < POOR_WL_SWAPCHAIN_BUFFERS; i++) {
 		swapchain->buffers[i].swapchain = swapchain;
 		swapchain->buffers[i].allocated = swapchain->buffers[i].busy = swapchain->buffers[i].stale = false;
+		swapchain->buffers[i].waiting = false;
 	}
 	poor_zwp_linux_dmabuf_v1_get_surface_feedback(dmabuf, &swapchain->feedback, surface);
 	poor_zwp_linux_dmabuf_feedback_v1_add_listener(&swapchain->feedback, &feedback_listener, swapchain);
 }
 
-/* Release points wake the swapchain through one eventfd, a binary syncobj imports the fences */
+/* Release points wake the swapchain through one eventfd */
 POOR_WL_EXPORT int poor_wl_swapchain_set_syncobj(struct poor_wl_swapchain *swapchain,
 						 struct poor_wp_linux_drm_syncobj_manager_v1 *manager, int drm_fd)
 {
 	struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ_TIMELINE };
-	int ret, fd;
+	int fd;
 
 	assert(!swapchain->syncobj_manager && !swapchain->allocator);
 	if (drm_ioctl(drm_fd, DRM_IOCTL_GET_CAP, &cap) < 0)
@@ -515,11 +538,6 @@ POOR_WL_EXPORT int poor_wl_swapchain_set_syncobj(struct poor_wl_swapchain *swapc
 	fd = eventfd(0, EFD_CLOEXEC);
 	if (fd < 0)
 		return -errno;
-	ret = syncobj_create(drm_fd, &swapchain->import_syncobj);
-	if (ret < 0) {
-		poor_loop_close_fd_or_submit(swapchain->loop, fd, 0);
-		return ret;
-	}
 	swapchain->syncobj_manager = manager;
 	swapchain->drm_fd = drm_fd;
 	swapchain->eventfd = fd;
@@ -595,10 +613,8 @@ POOR_WL_EXPORT void poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchai
 			buffer_free(&swapchain->buffers[i]);
 	if (swapchain->frame_pending)
 		poor_wl_callback_destroy(&swapchain->frame);
-	if (swapchain->syncobj_manager) {
+	if (swapchain->syncobj_manager)
 		poor_wp_linux_drm_syncobj_surface_v1_destroy(&swapchain->syncobj_surface);
-		syncobj_destroy(swapchain->drm_fd, swapchain->import_syncobj);
-	}
 	poor_zwp_linux_dmabuf_feedback_v1_destroy(&swapchain->feedback);
 	if (swapchain->table)
 		munmap(swapchain->table, swapchain->table_size);

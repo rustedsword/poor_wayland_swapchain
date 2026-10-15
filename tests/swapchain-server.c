@@ -89,6 +89,11 @@ static struct {
 	struct poor_wl_global compositor, dmabuf, syncobj;
 	struct poor_wl_list feedbacks;
 	struct test_client clients[MAX_CLIENTS];
+	struct {
+		uint32_t syncobj;
+		uint64_t point;
+	} held[8];
+	unsigned held_count;
 } server;
 
 static void *server_alloc(struct poor_wl_display *, struct poor_wl_client *, size_t size)
@@ -205,6 +210,17 @@ static void surface_frame(struct poor_wl_client *client, struct poor_wl_surface_
 	surface->frames[surface->frame_count++] = frame;
 }
 
+static void release_point(uint32_t syncobj, uint64_t point)
+{
+	if (!swapchain_server.hold_releases) {
+		syncobj_signal(syncobj, point);
+		return;
+	}
+	assert(server.held_count < ARRAY_SIZE(server.held));
+	server.held[server.held_count].syncobj = syncobj;
+	server.held[server.held_count++].point = point;
+}
+
 /* By the commit the rendering of the buffer has a fence on the acquire point, which may still be pending */
 static void surface_sync_commit(struct surface_sync *sync, struct buffer *buffer)
 {
@@ -236,7 +252,7 @@ static void surface_commit(struct poor_wl_client *, struct poor_wl_surface_resou
 		buffer->pending_on = nullptr;
 		if (surface->current && surface->current != buffer) {
 			if (surface->sync)
-				syncobj_signal(surface->current->release_syncobj, surface->current->release_point);
+				release_point(surface->current->release_syncobj, surface->current->release_point);
 			else
 				poor_wl_buffer_send_release(&surface->current->resource);
 			surface->current->current_on = nullptr;
@@ -649,6 +665,7 @@ static void display_done(struct poor_wl_display *)
 void swapchain_server_start(struct poor_loop *loop)
 {
 	server.loop = loop;
+	server.held_count = 0;
 	poor_wl_list_init(&server.feedbacks);
 	poor_wl_display_init(&server.display, loop, display_done);
 	poor_wl_display_set_allocator(&server.display, server_alloc, server_free);
@@ -670,4 +687,11 @@ void swapchain_server_send_feedback(void)
 void swapchain_server_stop(void)
 {
 	poor_wl_display_destroy(&server.display);
+}
+
+void swapchain_server_release_held(void)
+{
+	for (unsigned i = 0; i < server.held_count; i++)
+		syncobj_signal(server.held[i].syncobj, server.held[i].point);
+	server.held_count = 0;
 }

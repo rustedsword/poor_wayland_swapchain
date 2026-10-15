@@ -51,7 +51,7 @@ struct poor_wl_swapchain_buffer {
 	unsigned plane_count;
 	uint32_t syncobj;
 	int32_t width, height;
-	bool allocated, busy, stale;
+	bool allocated, busy, stale, waiting;
 };
 
 struct poor_wl_swapchain_allocator {
@@ -112,7 +112,7 @@ struct poor_wl_swapchain {
 	size_t table_size;
 	uint64_t released;
 	dev_t main_device, device;
-	uint32_t format, time, import_syncobj;
+	uint32_t format, time;
 	int drm_fd, eventfd;
 	int32_t width, height;
 	bool has_main_device, has_device, frame_pending, frame_wanted, failed;

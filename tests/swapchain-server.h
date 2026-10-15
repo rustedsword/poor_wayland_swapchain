@@ -9,7 +9,8 @@
 /*
  * A compositor for the swapchain tests: it shows buffers of wl_surfaces, releases the previous one and fires the
  * frame callbacks on each commit, and imports any dmabuf. The feedback is set before it starts. Explicit
- * synchronization needs 'syncobj_fd', a DRM device with timeline syncobjs.
+ * synchronization needs 'syncobj_fd', a DRM device with timeline syncobjs, 'hold_releases' keeps the release
+ * points from signaling.
  */
 struct swapchain_server_tranche {
 	dev_t device;
@@ -36,6 +37,7 @@ struct swapchain_server_state {
 	unsigned planes;
 	dev_t sampling_device;
 	int syncobj_fd;
+	bool hold_releases;
 	unsigned acquires;
 	uint64_t acquire_point, release_point;
 	bool display_done;
@@ -48,6 +50,8 @@ void swapchain_server_start(struct poor_loop *loop);
 int swapchain_server_connect(void);
 /* Send the feedback again to all feedback objects */
 void swapchain_server_send_feedback(void);
+/* Signal the release points that were held */
+void swapchain_server_release_held(void);
 void swapchain_server_stop(void);
 
 #endif

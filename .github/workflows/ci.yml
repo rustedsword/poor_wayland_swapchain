@@ -24,7 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends meson pkgconf libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev libvulkan-dev vulkan-validationlayers mesa-vulkan-drivers ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
+        run: |
+          echo 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sources.list.d/backports.list
+          apt-get update
+          apt-get install -y --no-install-recommends -t trixie-backports linux-libc-dev
+          apt-get install -y --no-install-recommends meson pkgconf libffi-dev libexpat1-dev libxml2-dev libgbm-dev libegl-dev libgles-dev libvulkan-dev vulkan-validationlayers mesa-vulkan-drivers ${{ matrix.deps == 'system' && 'liburing-dev' || '' }}
       - name: Fetch subprojects
         run: |
           git -c safe.directory='*' submodule update --init subprojects/poor_wayland subprojects/wayland-protocols

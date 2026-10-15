@@ -35,6 +35,10 @@ foreach h: [ 'sys/prctl.h' ]
 	config_h.set('HAVE_' + h.underscorify().to_upper(), cc.has_header(h))
 endforeach
 
+if not cc.has_header_symbol('drm/drm.h', 'DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_TIMELINE')
+	error('the swapchain needs the kernel headers of Linux 6.16 or newer')
+endif
+
 foreach f: [ 'prctl', 'gettid' ]
 	config_h.set('HAVE_' + f.underscorify().to_upper(), cc.has_function(f))
 endforeach

@@ -428,6 +428,73 @@ TEST(explicit_sync)
 	loop_fini(&loop);
 }
 
+/* With all buffers held by the compositor, the next frame waits for a release point */
+TEST(explicit_sync_waits_for_releases)
+{
+	struct poor_loop loop;
+	struct client c;
+	int fd;
+
+	loop_init(&loop);
+	fd = render_node_open(&loop);
+	if (fd < 0) {
+		loop_fini(&loop);
+		return;
+	}
+	server_config(4);
+	swapchain_server.syncobj_fd = fd;
+	swapchain_server.hold_releases = true;
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	assert(!poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd));
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	c.max_frames = 10;
+	poor_wl_swapchain_resize(&c.swapchain, 64, 32);
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	run_until(&loop, swapchain_server.commits == POOR_WL_SWAPCHAIN_BUFFERS);
+	client_roundtrip(&c);
+	assert(swapchain_server.commits == POOR_WL_SWAPCHAIN_BUFFERS && c.allocations == POOR_WL_SWAPCHAIN_BUFFERS);
+	swapchain_server.hold_releases = false;
+	swapchain_server_release_held();
+	run_until(&loop, swapchain_server.commits == 10);
+	assert(c.frames == 10 && c.allocations == POOR_WL_SWAPCHAIN_BUFFERS);
+	client_stop(&c);
+	server_stop(&loop);
+	poor_loop_close_fd_or_submit(&loop, fd, 0);
+	loop_fini(&loop);
+}
+
+/* Buffers that a resize replaced go once the compositor releases them, without another frame */
+TEST(explicit_sync_frees_replaced_buffers)
+{
+	struct poor_loop loop;
+	struct client c;
+	int fd;
+
+	loop_init(&loop);
+	fd = render_node_open(&loop);
+	if (fd < 0) {
+		loop_fini(&loop);
+		return;
+	}
+	server_config(4);
+	swapchain_server.syncobj_fd = fd;
+	swapchain_server.hold_releases = true;
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	assert(!poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd));
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 64, 32, 2);
+	assert(c.allocations == 2 && !c.frees);
+	poor_wl_swapchain_resize(&c.swapchain, 32, 32);
+	swapchain_server_release_held();
+	run_until(&loop, c.frees == 1);
+	client_stop(&c);
+	server_stop(&loop);
+	poor_loop_close_fd_or_submit(&loop, fd, 0);
+	loop_fini(&loop);
+}
+
 TEST(explicit_sync_needs_drm_device)
 {
 	struct poor_loop loop;
