@@ -373,8 +373,11 @@ int main(int argc, char *argv[])
 		pid = fork();
 		assert(pid >= 0);
 
-		if (pid == 0)
+		if (pid == 0) {
+			if (t->must_fail)
+				test_disable_coredumps();
 			run_test(t); /* never returns */
+		}
 
 		if (waitpid(pid, &info, 0) == -1) {
 			stderr_set_color(RED);
