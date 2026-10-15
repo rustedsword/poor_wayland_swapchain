@@ -12,6 +12,10 @@
  * synchronization needs 'syncobj_fd', a DRM device with timeline syncobjs, 'hold_releases' keeps the release
  * points from signaling.
  */
+struct swapchain_server_rect {
+	int32_t x, y, width, height;
+};
+
 struct swapchain_server_tranche {
 	dev_t device;
 	uint32_t flags;
@@ -36,6 +40,8 @@ struct swapchain_server_state {
 	uint64_t modifier;
 	unsigned planes;
 	dev_t sampling_device;
+	struct swapchain_server_rect damage[8];
+	unsigned damage_count;
 	int syncobj_fd;
 	bool hold_releases;
 	unsigned acquires;

@@ -13,7 +13,9 @@ extern "C" {
 /*
  * Vulkan images for the swapchain. The functions come from the vkGetInstanceProcAddr of the caller, so the library
  * doesn't link the Vulkan loader. Vulkan has no implicit synchronization: present them with explicit
- * synchronization, with the fences of their drawing, after releasing them to VK_QUEUE_FAMILY_FOREIGN_EXT.
+ * synchronization, with the fences of their drawing, after releasing them to VK_QUEUE_FAMILY_FOREIGN_EXT. Their
+ * contents, which the age of buffers is about, stay when they are acquired back from VK_QUEUE_FAMILY_FOREIGN_EXT in the
+ * layout of the release, not from VK_IMAGE_LAYOUT_UNDEFINED.
  */
 
 constexpr uint32_t POOR_WL_VULKAN_DEVICE_EXTENSIONS = 6;

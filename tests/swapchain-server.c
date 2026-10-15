@@ -55,6 +55,8 @@ struct surface {
 	struct surface_sync *sync;
 	struct frame *frames[MAX_FRAMES];
 	unsigned frame_count;
+	struct swapchain_server_rect damage[ARRAY_SIZE(swapchain_server.damage)];
+	unsigned damage_count;
 };
 
 struct timeline {
@@ -197,6 +199,15 @@ static void surface_damage(struct poor_wl_client *, struct poor_wl_surface_resou
 {
 }
 
+static void surface_damage_buffer(struct poor_wl_client *, struct poor_wl_surface_resource *resource, int32_t x, int32_t y,
+				  int32_t width, int32_t height)
+{
+	struct surface *surface = container_of(resource, struct surface, resource);
+
+	assert(surface->damage_count < ARRAY_SIZE(surface->damage));
+	surface->damage[surface->damage_count++] = (struct swapchain_server_rect){ x, y, width, height };
+}
+
 static void surface_frame(struct poor_wl_client *client, struct poor_wl_surface_resource *resource, uint32_t id)
 {
 	struct surface *surface = container_of(resource, struct surface, resource);
@@ -270,6 +281,9 @@ static void surface_commit(struct poor_wl_client *, struct poor_wl_surface_resou
 		swapchain_server.planes = buffer->planes;
 		swapchain_server.sampling_device = buffer->sampling_device;
 	}
+	copy_array(swapchain_server.damage, arrview_first(surface->damage_count, surface->damage));
+	swapchain_server.damage_count = surface->damage_count;
+	surface->damage_count = 0;
 	surface->frame_count = 0;
 	foreach_array_const_ref(frames, frame) {
 		(*frame)->surface = nullptr;
@@ -284,7 +298,7 @@ static const struct poor_wl_surface_interface surface_impl = {
 	.damage = surface_damage,
 	.frame = surface_frame,
 	.commit = surface_commit,
-	.damage_buffer = surface_damage,
+	.damage_buffer = surface_damage_buffer,
 };
 
 static void surface_destroy(struct poor_wl_resource *resource)
@@ -315,7 +329,7 @@ static void compositor_create_surface(struct poor_wl_client *client, struct poor
 	poor_wl_surface_resource_set_implementation(&surface->resource, &surface_impl, nullptr, surface_destroy);
 	surface->pending = surface->current = nullptr;
 	surface->sync = nullptr;
-	surface->frame_count = 0;
+	surface->frame_count = surface->damage_count = 0;
 }
 
 static const struct poor_wl_compositor_interface compositor_impl = {

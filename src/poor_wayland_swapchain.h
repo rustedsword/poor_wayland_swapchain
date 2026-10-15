@@ -3,6 +3,7 @@
 #define POOR_WAYLAND_SWAPCHAIN_H
 
 #include <linux/stat.h>
+#include <poor_array.h>
 #include <poor_loop_group.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -37,7 +38,16 @@ struct poor_wl_swapchain_plane {
 	uint32_t stride;
 };
 
-/* The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes. */
+/* A rectangle in buffer coordinates */
+struct poor_wl_swapchain_rect {
+	int32_t x, y, width, height;
+};
+
+/*
+ * The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes.
+ * 'age' is set before the frame function: the buffer holds the frame presented 'age' frames ago, 1 being the last one,
+ * or undefined contents if it is 0.
+ */
 struct poor_wl_swapchain_buffer {
 	struct poor_wl_buffer buffer;
 	struct poor_wp_linux_drm_syncobj_timeline_v1 timeline;
@@ -47,6 +57,7 @@ struct poor_wl_swapchain_buffer {
 	void *data;
 	uint64_t modifier;
 	uint64_t point;
+	uint64_t age, presented;
 	struct poor_wl_swapchain_plane planes[POOR_WL_SWAPCHAIN_PLANES];
 	unsigned plane_count;
 	uint32_t syncobj;
@@ -110,7 +121,7 @@ struct poor_wl_swapchain {
 	poor_wl_swapchain_done_fn *done_fn;
 	void *table;
 	size_t table_size;
-	uint64_t released;
+	uint64_t released, presents;
 	dev_t main_device, device;
 	uint32_t format, time;
 	int drm_fd, eventfd;
@@ -153,10 +164,20 @@ poor_wl_swapchain_request_frame(struct poor_wl_swapchain *swapchain);
 /*
  * Attach, damage and commit the buffer that 'frame' got, with a frame callback. 'fence' is a sync_file that signals
  * once the buffer is rendered, or -1 if it already is, and the swapchain closes it. Fences need explicit
- * synchronization.
+ * synchronization. Other state of the commit, like a viewport or presentation feedback, goes in before this call.
  */
 void
 poor_wl_swapchain_present(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, int fence);
+
+/*
+ * Like poor_wl_swapchain_present(), with 'damage', an array of struct poor_wl_swapchain_rect or a pointer to one, as
+ * the parts that changed since the last frame. Surfaces older than version 4 get their whole area damaged.
+ */
+void
+poor_wl_swapchain_present_damage_impl(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer,
+				      int fence, size_t count, const struct poor_wl_swapchain_rect (*damage)[count]);
+#define poor_wl_swapchain_present_damage(swapchain, buffer, fence, damage) \
+	poor_wl_swapchain_present_damage_impl(swapchain, buffer, fence, ARRAY_SIZE(damage), &auto_arr(damage))
 
 /* Free all buffers, before the device of the allocator goes away. 'done' is called once the swapchain's memory can go. */
 void

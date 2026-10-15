@@ -298,6 +298,7 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 	poor_wl_buffer_add_listener(&buffer->buffer, &buffer_listener, buffer);
 	buffer->allocated = true;
 	buffer->busy = buffer->stale = buffer->waiting = false;
+	buffer->presented = 0;
 	return 0;
 }
 
@@ -340,6 +341,7 @@ static void swapchain_render(struct poor_wl_swapchain *swapchain)
 		swapchain_fail(swapchain, -ret);
 		return;
 	}
+	buffer->age = buffer->presented ? swapchain->presents - buffer->presented + 1 : 0;
 	swapchain->frame_wanted = false;
 	swapchain->rendering = buffer;
 	swapchain->frame_fn(swapchain, buffer, swapchain->time);
@@ -511,6 +513,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, 
 	swapchain->rendering = nullptr;
 	swapchain->table = nullptr;
 	swapchain->table_size = 0;
+	swapchain->presents = 0;
 	swapchain->tranche_count = swapchain->pending_count = 0;
 	swapchain->tranche.device = 0;
 	swapchain->tranche.flags = 0;
@@ -577,8 +580,9 @@ POOR_WL_EXPORT void poor_wl_swapchain_request_frame(struct poor_wl_swapchain *sw
 	swapchain_render(swapchain);
 }
 
-POOR_WL_EXPORT void poor_wl_swapchain_present(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer,
-					      int fence)
+POOR_WL_EXPORT void poor_wl_swapchain_present_damage_impl(struct poor_wl_swapchain *swapchain,
+							   struct poor_wl_swapchain_buffer *buffer, int fence, size_t count,
+							   const struct poor_wl_swapchain_rect (*damage)[count])
 {
 	struct poor_wl_surface *surface = swapchain->surface;
 	int ret = 0;
@@ -594,15 +598,26 @@ POOR_WL_EXPORT void poor_wl_swapchain_present(struct poor_wl_swapchain *swapchai
 		return;
 	}
 	poor_wl_surface_attach(surface, &buffer->buffer, 0, 0);
-	if (poor_wl_surface_get_version(surface) >= POOR_WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION)
-		poor_wl_surface_damage_buffer(surface, 0, 0, INT32_MAX, INT32_MAX);
-	else
+	if (poor_wl_surface_get_version(surface) >= POOR_WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+		foreach_array_const_ref(damage, rect)
+			poor_wl_surface_damage_buffer(surface, rect->x, rect->y, rect->width, rect->height);
+	} else {
 		poor_wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);
+	}
 	poor_wl_surface_frame(surface, &swapchain->frame);
 	poor_wl_callback_add_listener(&swapchain->frame, &frame_listener, swapchain);
 	poor_wl_surface_commit(surface);
+	buffer->presented = ++swapchain->presents;
 	buffer->busy = true;
 	swapchain->frame_pending = true;
+}
+
+POOR_WL_EXPORT void poor_wl_swapchain_present(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer,
+					      int fence)
+{
+	static const struct poor_wl_swapchain_rect whole[] = { { 0, 0, INT32_MAX, INT32_MAX } };
+
+	poor_wl_swapchain_present_damage(swapchain, buffer, fence, whole);
 }
 
 /*

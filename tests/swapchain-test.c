@@ -34,8 +34,9 @@ struct client {
 	struct poor_wl_swapchain swapchain;
 	dev_t device;
 	unsigned devices, frames, max_frames, allocations, frees;
+	uint64_t ages[32];
 	int swapchain_error, fence_fd;
-	bool synced, done, error_called, fail_scanout, have_syncobj, swapchain_done;
+	bool synced, done, error_called, fail_scanout, have_syncobj, swapchain_done, partial;
 	char in[16384];
 	char out[16384];
 	union poor_wl_map_entry objects[64];
@@ -129,13 +130,19 @@ static int signaled_fence(int drm_fd)
 	return export.fd;
 }
 
+static const struct poor_wl_swapchain_rect partial_damage[] = { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } };
+
 static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t)
 {
 	struct client *c = client_of(swapchain);
+	int fence = c->fence_fd >= 0 ? signaled_fence(c->fence_fd) : -1;
 
-	assert(buffer->width == swapchain->width && buffer->height == swapchain->height);
-	c->frames++;
-	poor_wl_swapchain_present(swapchain, buffer, c->fence_fd >= 0 ? signaled_fence(c->fence_fd) : -1);
+	assert(buffer->width == swapchain->width && buffer->height == swapchain->height && c->frames < ARRAY_SIZE(c->ages));
+	c->ages[c->frames++] = buffer->age;
+	if (c->partial)
+		poor_wl_swapchain_present_damage(swapchain, buffer, fence, partial_damage);
+	else
+		poor_wl_swapchain_present(swapchain, buffer, fence);
 	if (c->frames < c->max_frames)
 		poor_wl_swapchain_request_frame(swapchain);
 }
@@ -210,7 +217,7 @@ static void client_start(struct client *c, struct poor_loop *loop, uint32_t form
 	c->devices = c->frames = c->max_frames = c->allocations = c->frees = 0;
 	c->swapchain_error = 0;
 	c->fence_fd = -1;
-	c->synced = c->done = c->error_called = c->fail_scanout = c->have_syncobj = c->swapchain_done = false;
+	c->synced = c->done = c->error_called = c->fail_scanout = c->have_syncobj = c->swapchain_done = c->partial = false;
 	poor_wl_display_connect_to_fd(&c->display, loop, &memory, swapchain_server_connect(), client_error, client_done);
 	poor_wl_display_get_registry(&c->display, &c->registry);
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
@@ -278,6 +285,53 @@ TEST(frames_are_presented)
 	assert(swapchain_server.format == DRM_FORMAT_XRGB8888 && swapchain_server.modifier == I915_FORMAT_MOD_X_TILED);
 	assert(swapchain_server.planes == 1 && swapchain_server.stride == 64 * 4);
 	assert(c.allocations == 2 && swapchain_server.buffers_created == 2 && !c.frees);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(damage_reaches_compositor)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 1);
+	assert(swapchain_server.damage_count == 1 && !swapchain_server.damage[0].x && !swapchain_server.damage[0].y &&
+	       swapchain_server.damage[0].width == INT32_MAX && swapchain_server.damage[0].height == INT32_MAX);
+	c.partial = true;
+	client_present(&c, 16, 16, 1);
+	assert(swapchain_server.damage_count == ARRAY_SIZE(partial_damage));
+	foreach_array_index(partial_damage, i) {
+		const struct swapchain_server_rect *rect = &swapchain_server.damage[i];
+
+		assert(rect->x == partial_damage[i].x && rect->y == partial_damage[i].y &&
+		       rect->width == partial_damage[i].width && rect->height == partial_damage[i].height);
+	}
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+/* Two buffers take turns, so the one that comes back holds the frame before the last one, and new ones hold nothing */
+TEST(buffers_know_their_age)
+{
+	static const uint64_t ages[] = { 0, 0, 2, 2, 0, 0, 2 };
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 4);
+	client_present(&c, 32, 16, 3);
+	assert(c.frames == ARRAY_SIZE(ages) && !memcmp(c.ages, ages, ARRAY_SIZE_BYTES(ages)));
 	client_stop(&c);
 	server_stop(&loop);
 	loop_fini(&loop);
