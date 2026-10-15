@@ -43,7 +43,7 @@ struct client {
 	VkSemaphore rendered;
 	PFN_vkGetSemaphoreFdKHR get_semaphore_fd;
 	uint32_t family;
-	unsigned frames, max_frames, allocations, frees;
+	unsigned frames, max_frames, allocations, frees, partial_frames;
 	bool synced, done, error_called, swapchain_done;
 	char in[16384];
 	char out[16384];
@@ -234,24 +234,32 @@ static void swapchain_device(struct poor_wl_swapchain *, dev_t)
 {
 }
 
-/* A clear, then the image goes to the compositor with the fence of the batch, as in simple-vulkan. A buffer comes back
- * after its last drawing, which Vulkan learns from the fence of that batch. */
+static const struct poor_wl_swapchain_rect dot[] = { { 1, 1, 8, 8 } };
+
+/*
+ * A buffer without an age is cleared, one with an age comes back from the queue family of the compositor with its
+ * contents and only gets a dot redrawn, as in simple-vulkan. The image goes to the compositor with the fence of the
+ * batch. A buffer comes back after its last drawing, which Vulkan learns from the fence of that batch.
+ */
 static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t)
 {
 	struct client *c = client_of(swapchain);
 	struct target *target = target_of(c, buffer);
 	VkImage image = ((struct poor_wl_vulkan_image *)buffer->data)->image;
+	bool partial = buffer->age;
+	VkClearRect clear = { .rect = { { dot[0].x, dot[0].y }, { (uint32_t)dot[0].width, (uint32_t)dot[0].height } },
+			      .layerCount = 1 };
 	VkCommandBufferBeginInfo begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	VkImageMemoryBarrier draw = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.oldLayout = partial ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
 		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.srcQueueFamilyIndex = partial ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = partial ? c->family : VK_QUEUE_FAMILY_IGNORED,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
@@ -269,10 +277,11 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
 		.imageView = target->view,
 		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.loadOp = partial ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR,
 		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 		.clearValue = { .color = { .float32 = { 0.25f * (c->frames % 4), 0.5f, 1.0f, 1.0f } } },
 	};
+	VkClearAttachment fill = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = attachment.clearValue };
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
 		.renderArea = { .extent = { (uint32_t)buffer->width, (uint32_t)buffer->height } },
@@ -301,6 +310,8 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &draw);
 	vkCmdBeginRendering(target->commands, &rendering);
+	if (partial)
+		vkCmdClearAttachments(target->commands, 1, &fill, 1, &clear);
 	vkCmdEndRendering(target->commands);
 	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
@@ -308,7 +319,11 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	assert(vkQueueSubmit(c->queue, 1, &submit, target->done) == VK_SUCCESS);
 	assert(c->get_semaphore_fd(c->device, &get, &fence) == VK_SUCCESS);
 	c->frames++;
-	poor_wl_swapchain_present(swapchain, buffer, fence);
+	c->partial_frames += partial;
+	if (partial)
+		poor_wl_swapchain_present_damage(swapchain, buffer, fence, dot);
+	else
+		poor_wl_swapchain_present(swapchain, buffer, fence);
 	if (c->frames < c->max_frames)
 		poor_wl_swapchain_request_frame(swapchain);
 }
@@ -378,7 +393,7 @@ static void client_start(struct client *c, int syncobj_fd)
 {
 	struct poor_wl_connection_memory memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);
 
-	c->frames = c->max_frames = c->allocations = c->frees = 0;
+	c->frames = c->max_frames = c->allocations = c->frees = c->partial_frames = 0;
 	c->synced = c->done = c->error_called = c->swapchain_done = false;
 	poor_wl_display_connect_to_fd(&c->display, c->loop, &memory, swapchain_server_connect(), client_error, client_done);
 	poor_wl_display_get_registry(&c->display, &c->registry);
@@ -445,7 +460,7 @@ TEST(vulkan_frames)
 	client_start(&c, fd);
 	client_present(&c, 64, 32, 10);
 	client_present(&c, 96, 64, 10);
-	assert(swapchain_server.acquires == 20 && swapchain_server.planes >= 1 && c.allocations >= 2);
+	assert(swapchain_server.acquires == 20 && swapchain_server.planes >= 1 && c.allocations >= 2 && c.partial_frames);
 	client_stop(&c);
 	swapchain_server_stop();
 	run_until(&loop, swapchain_server.display_done);

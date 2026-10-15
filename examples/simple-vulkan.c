@@ -25,17 +25,27 @@
 #include "xdg-shell-client-protocol.h"
 
 /*
- * A window that goes through all hues, cleared with Vulkan on the GPU that the compositor names in its dmabuf
- * feedback and presented through the swapchain. Vulkan has no implicit synchronization, so the compositor needs
- * explicit synchronization. It runs until its close button is pressed or until SIGINT or SIGTERM.
- * WAYLAND_DEBUG=client shows the protocol.
+ * A square that goes through all hues and bounces over a still background, cleared with Vulkan on the GPU that the
+ * compositor names in its dmabuf feedback and presented through the swapchain. A frame damages only where the square
+ * was and is, and a buffer redraws only what changed since the frame that it holds, which its age tells. Vulkan has no
+ * implicit synchronization, so the compositor needs explicit synchronization. It runs until its close button is
+ * pressed or until SIGINT or SIGTERM. WAYLAND_DEBUG=client shows the protocol.
  */
 constexpr int32_t DEFAULT_WIDTH = 640;
 constexpr int32_t DEFAULT_HEIGHT = 480;
+constexpr int32_t SQUARE = 96;
+constexpr unsigned HISTORY = 4;
 constexpr uint64_t DRAIN_TIMEOUT_NS = 1'000'000'000;
 constexpr VkFormat FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 
+static const VkClearColorValue background = { .float32 = { 0.1f, 0.1f, 0.12f, 1.0f } };
+
 poor_loop_fd_declare(signal_file);
+
+/* What changed in a frame since the frame before it */
+struct damage {
+	struct poor_wl_swapchain_rect rects[2];
+};
 
 /* How the image of a buffer of the swapchain is drawn */
 struct target {
@@ -59,6 +69,8 @@ struct app {
 	struct poor_wl_swapchain swapchain;
 	struct poor_wl_vulkan vulkan;
 	struct target targets[POOR_WL_SWAPCHAIN_BUFFERS];
+	struct damage history[HISTORY];
+	struct poor_wl_swapchain_rect square;
 	VkInstance instance;
 	VkPhysicalDevice physical;
 	VkDevice device;
@@ -75,7 +87,7 @@ struct app {
 	struct signalfd_siginfo siginfo;
 	sigset_t sigset;
 	int status;
-	int32_t width, height;
+	int32_t width, height, presented_width, presented_height;
 	bool have_compositor, have_dmabuf, have_syncobj, have_wm_base;
 	bool swapchain_started, swapchain_closed, closing, signals_closed;
 	char path[32];
@@ -421,27 +433,69 @@ static VkClearColorValue hue(uint32_t time)
 	}
 }
 
+/* The square crosses the window back and forth at 'speed' pixels per second */
+static int32_t bounce(uint32_t time, uint32_t speed, int32_t range)
+{
+	uint64_t at = range > 0 ? (uint64_t)time * speed / 1000 % (2 * (uint64_t)range) : 0;
+
+	return at <= (uint64_t)range ? at : 2 * (uint64_t)range - at;
+}
+
+static struct poor_wl_swapchain_rect square_at(uint32_t time, int32_t width, int32_t height)
+{
+	int32_t side = width < SQUARE ? width : SQUARE;
+
+	side = height < side ? height : side;
+	return (struct poor_wl_swapchain_rect){ bounce(time, 300, width - side), bounce(time, 200, height - side), side, side };
+}
+
+/* The part of 'rect' in the image, if there is one */
+static bool clear_rect(const struct poor_wl_swapchain_rect *rect, int32_t width, int32_t height, VkClearRect *clear)
+{
+	int64_t x0 = rect->x > 0 ? rect->x : 0, y0 = rect->y > 0 ? rect->y : 0;
+	int64_t x1 = (int64_t)rect->x + rect->width, y1 = (int64_t)rect->y + rect->height;
+
+	x1 = x1 < width ? x1 : width;
+	y1 = y1 < height ? y1 : height;
+	if (x0 >= x1 || y0 >= y1)
+		return false;
+	*clear = (VkClearRect){ .rect = { { (int32_t)x0, (int32_t)y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } },
+				.layerCount = 1 };
+	return true;
+}
+
 /*
- * The old contents of the image don't matter. It goes to the queue family of the compositor, which reads it once
- * the fence of the batch signals. The compositor was done with the buffer, and so was the last batch that drew it,
- * which Vulkan learns from the fence of that batch.
+ * A buffer without an age is cleared whole. One with an age keeps its contents: it comes back from the queue family of
+ * the compositor, and what changed since its frame is cleared to the background before the square goes on top. The
+ * image goes to the queue family of the compositor, which reads it once the fence of the batch signals. The
+ * compositor was done with the buffer, and so was the last batch that drew it, which Vulkan learns from the fence of
+ * that batch.
  */
 static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t time)
 {
 	struct app *app = app_of_swapchain(swapchain);
 	struct target *target = target_of(app, buffer);
 	VkImage image = ((struct poor_wl_vulkan_image *)buffer->data)->image;
+	struct poor_wl_swapchain_rect square = square_at(time, buffer->width, buffer->height);
+	bool whole = buffer->width != app->presented_width || buffer->height != app->presented_height;
+	bool full = whole || !buffer->age || buffer->age > ARRAY_SIZE(app->history) + 1;
+	struct damage damage = whole ? (struct damage){ { { 0, 0, INT32_MAX, INT32_MAX } } } :
+				       (struct damage){ { app->square, square } };
+	VkClearRect clears[(ARRAY_SIZE(app->history) + 1) * ARRAY_SIZE(damage.rects)], square_clear;
+	VkClearAttachment fill = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = { .color = background } };
+	VkClearAttachment paint = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = { .color = hue(time) } };
+	uint32_t count = 0;
 	VkCommandBufferBeginInfo begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	VkImageMemoryBarrier draw = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.oldLayout = full ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
 		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.srcQueueFamilyIndex = full ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_FOREIGN_EXT,
+		.dstQueueFamilyIndex = full ? VK_QUEUE_FAMILY_IGNORED : app->family,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
@@ -459,9 +513,9 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
 		.imageView = target->view,
 		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.loadOp = full ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
 		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-		.clearValue = { .color = hue(time) },
+		.clearValue = { .color = background },
 	};
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -486,6 +540,14 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 
 	if (app->closing)
 		return;
+	if (!full) {
+		foreach_array_const_ref(damage.rects, rect)
+			count += clear_rect(rect, buffer->width, buffer->height, &clears[count]);
+		foreach_array_const_ref(arrview_first(buffer->age - 1, app->history), older)
+			foreach_array_const_ref(older->rects, rect)
+				count += clear_rect(rect, buffer->width, buffer->height, &clears[count]);
+	}
+	clear_rect(&square, buffer->width, buffer->height, &square_clear);
 	if (vkGetFenceStatus(app->device, target->done) != VK_SUCCESS) {
 		log_printf("simple-vulkan: a buffer came back before its drawing was done\n");
 		app_quit(app, 1);
@@ -499,6 +561,9 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &draw);
 	vkCmdBeginRendering(target->commands, &rendering);
+	if (count)
+		vkCmdClearAttachments(target->commands, 1, &fill, count, clears);
+	vkCmdClearAttachments(target->commands, 1, &paint, 1, &square_clear);
 	vkCmdEndRendering(target->commands);
 	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
@@ -508,7 +573,14 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		app_quit(app, 1);
 		return;
 	}
-	poor_wl_swapchain_present(swapchain, buffer, fence);
+	if (whole)
+		poor_wl_swapchain_present(swapchain, buffer, fence);
+	else
+		poor_wl_swapchain_present_damage(swapchain, buffer, fence, damage.rects);
+	array_insert(app->history, 0, damage);
+	app->square = square;
+	app->presented_width = buffer->width;
+	app->presented_height = buffer->height;
 	poor_wl_swapchain_request_frame(swapchain);
 }
 
@@ -673,6 +745,7 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->status = 0;
 	app->width = DEFAULT_WIDTH;
 	app->height = DEFAULT_HEIGHT;
+	app->presented_width = app->presented_height = 0;
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
 		log_printf("simple-vulkan: can't connect: %s\n", strerror(errno));
 		return -1;
