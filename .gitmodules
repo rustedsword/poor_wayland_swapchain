@@ -4,3 +4,6 @@
 [submodule "subprojects/wayland-protocols"]
 	path = subprojects/wayland-protocols
 	url = https://gitlab.freedesktop.org/wayland/wayland-protocols.git
+[submodule "refs/Vulkan-Docs"]
+	path = refs/Vulkan-Docs
+	url = https://github.com/KhronosGroup/Vulkan-Docs
