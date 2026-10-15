@@ -60,8 +60,8 @@ struct poor_wl_swapchain_allocator {
 	 * contain DRM_FORMAT_MOD_INVALID. 'scanout' asks for a buffer that the display can show. Returns 0 or a
 	 * negative errno value.
 	 */
-	int (*allocate)(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-			unsigned count, bool scanout);
+	int (*allocate)(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
+			const uint64_t (*modifiers)[count], bool scanout);
 	void (*free)(void *data, struct poor_wl_swapchain_buffer *buffer);
 };
 

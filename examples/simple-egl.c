@@ -9,6 +9,7 @@
 #include <gbm.h>
 #include <poor_loop.h>
 #include <poor_loop_fd.h>
+#include <poor_loop_uring_array.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -162,23 +163,23 @@ static bool target_init(struct app *app, struct target *target, struct gbm_bo *b
 
 static struct target *target_of(struct app *app, struct poor_wl_swapchain_buffer *buffer)
 {
-	return &app->targets[buffer - app->swapchain.buffers];
+	return &app->targets[array_ref_index(app->swapchain.buffers, buffer)];
 }
 
 /* GBM allocates, the targets come and go with the buffers */
-static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-		    unsigned count, bool scanout)
+static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
+		    const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct app *app = data;
 	struct target *target = target_of(app, buffer);
-	int ret = poor_wl_gbm_allocator.allocate(&app->gbm, buffer, format, modifiers, count, scanout);
+	int ret = poor_wl_gbm_allocator.allocate(&app->gbm, buffer, format, count, modifiers, scanout);
 
 	if (ret < 0)
 		return ret;
 	if (!target_init(app, target, buffer->data)) {
 		target_fini(app, target);
-		for (unsigned i = 0; i < buffer->plane_count; i++)
-			poor_loop_close_fd_or_submit(&app->loop, buffer->planes[i].fd, 0);
+		foreach_array_const_ref(arrview_first(buffer->plane_count, buffer->planes), plane)
+			poor_loop_close_fd_or_submit(&app->loop, plane->fd, 0);
 		poor_wl_gbm_allocator.free(&app->gbm, buffer);
 		return -EINVAL;
 	}
@@ -208,7 +209,7 @@ static GLuint shader_compile(GLenum type, const char *source)
 	glCompileShader(shader);
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
 	if (!ok) {
-		glGetShaderInfoLog(shader, sizeof(info), nullptr, info);
+		glGetShaderInfoLog(shader, ARRAY_SIZE(info), nullptr, info);
 		log_printf("simple-egl: shader: %s\n", info);
 		glDeleteShader(shader);
 		return 0;
@@ -527,8 +528,8 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	poor_loop_fd_init(&app->signals, fd);
 	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
-	io_uring_prep_read(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
-			   &app->siginfo, sizeof(app->siginfo), -1);
+	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
+				 array_ptr(&app->siginfo), -1);
 	return 0;
 }
 

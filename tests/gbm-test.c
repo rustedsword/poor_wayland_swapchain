@@ -30,25 +30,25 @@ static void gbm_done(struct poor_wl_gbm *)
 TEST(gbm_device)
 {
 	const dev_t devices[] = { makedev(226, 0), makedev(226, 128) };
-	static const uint64_t implicit = DRM_FORMAT_MOD_INVALID;
+	static const uint64_t implicit[] = { DRM_FORMAT_MOD_INVALID };
 	struct poor_wl_swapchain_buffer buffer;
 	struct poor_wl_gbm gbm;
 	struct poor_loop loop;
 
 	loop_init(&loop);
 	assert(poor_wl_gbm_open(&gbm, &loop, makedev(1, 3), gbm_ready, gbm_done) == -1 && errno == ENODEV);
-	for (unsigned i = 0; i < ARRAY_SIZE(devices); i++) {
+	foreach_array_const_ref(devices, device) {
 		gbm_ready_called = gbm_done_called = false;
-		assert(!poor_wl_gbm_open(&gbm, &loop, devices[i], gbm_ready, gbm_done));
+		assert(!poor_wl_gbm_open(&gbm, &loop, *device, gbm_ready, gbm_done));
 		run_until(&loop, gbm_ready_called);
 		assert(!gbm.device != !gbm.error);
 		if (gbm.device) {
 			keep_loaded();
 			buffer.width = buffer.height = 64;
-			assert(!poor_wl_gbm_allocator.allocate(&gbm, &buffer, DRM_FORMAT_XRGB8888, &implicit, 1, false));
+			assert(!poor_wl_gbm_allocator.allocate(&gbm, &buffer, DRM_FORMAT_XRGB8888, ARRAY_SIZE(implicit), &implicit, false));
 			assert(buffer.modifier == DRM_FORMAT_MOD_INVALID && buffer.plane_count >= 1 && buffer.planes[0].stride >= 64 * 4);
-			for (unsigned j = 0; j < buffer.plane_count; j++)
-				poor_loop_close_fd_or_submit(&loop, buffer.planes[j].fd, 0);
+			foreach_array_const_ref(arrview_first(buffer.plane_count, buffer.planes), plane)
+				poor_loop_close_fd_or_submit(&loop, plane->fd, 0);
 			poor_wl_gbm_allocator.free(&gbm, &buffer);
 		}
 		poor_wl_gbm_close(&gbm);

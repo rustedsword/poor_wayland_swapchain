@@ -4,13 +4,14 @@
 
 #include <dlfcn.h>
 #include <link.h>
+#include <poor_array.h>
 
 static const char *keep_loaded_names[256];
 static unsigned keep_loaded_count;
 
 static int keep_loaded_collect(struct dl_phdr_info *info, size_t, void *)
 {
-	if (info->dlpi_name[0] && keep_loaded_count < sizeof(keep_loaded_names) / sizeof(keep_loaded_names[0]))
+	if (info->dlpi_name[0] && keep_loaded_count < ARRAY_SIZE(keep_loaded_names))
 		keep_loaded_names[keep_loaded_count++] = info->dlpi_name;
 	return 0;
 }

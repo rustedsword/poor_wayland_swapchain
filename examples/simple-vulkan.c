@@ -8,6 +8,8 @@
 #include <poll.h>
 #include <poor_loop.h>
 #include <poor_loop_fd.h>
+#include <poor_loop_uring_array.h>
+#include <poor_stdio.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,7 +188,7 @@ static void app_quit(struct app *app, int status)
 
 static struct target *target_of(struct app *app, struct poor_wl_swapchain_buffer *buffer)
 {
-	return &app->targets[buffer - app->swapchain.buffers];
+	return &app->targets[array_ref_index(app->swapchain.buffers, buffer)];
 }
 
 /* The last drawing is done by then, which Vulkan learns from the fence */
@@ -226,19 +228,19 @@ static bool target_init(struct app *app, struct target *target, VkImage image)
 }
 
 /* poor_wl_vulkan allocates, the targets come and go with the buffers */
-static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-		    unsigned count, bool scanout)
+static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
+		    const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct app *app = data;
 	struct target *target = target_of(app, buffer);
-	int ret = poor_wl_vulkan_allocator.allocate(&app->vulkan, buffer, format, modifiers, count, scanout);
+	int ret = poor_wl_vulkan_allocator.allocate(&app->vulkan, buffer, format, count, modifiers, scanout);
 
 	if (ret < 0)
 		return ret;
 	if (!target_init(app, target, ((struct poor_wl_vulkan_image *)buffer->data)->image)) {
 		target_fini(app, target);
-		for (unsigned i = 0; i < buffer->plane_count; i++)
-			poor_loop_close_fd_or_submit(&app->loop, buffer->planes[i].fd, 0);
+		foreach_array_const_ref(arrview_first(buffer->plane_count, buffer->planes), plane)
+			poor_loop_close_fd_or_submit(&app->loop, plane->fd, 0);
 		poor_wl_vulkan_allocator.free(&app->vulkan, buffer);
 		return -ENOMEM;
 	}
@@ -264,7 +266,7 @@ static bool device_queue_family(VkPhysicalDevice physical, uint32_t *family)
 	uint32_t count = ARRAY_SIZE(families);
 
 	vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families);
-	for (uint32_t i = 0; i < count; i++) {
+	foreach_array_index(arrview_first(count, families), i) {
 		if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
 			*family = i;
 			return true;
@@ -311,7 +313,7 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		.pNext = &features,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue_info,
-		.enabledExtensionCount = POOR_WL_VULKAN_DEVICE_EXTENSIONS,
+		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
 		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
 	};
 	VkCommandPoolCreateInfo pool_info = {
@@ -332,7 +334,7 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 	app->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, app->instance, device, render_minor);
 	if (app->physical) {
 		vkGetPhysicalDeviceProperties(app->physical, &properties);
-		memcpy(app->device_name, properties.deviceName, sizeof(app->device_name));
+		copy_array(app->device_name, properties.deviceName);
 	}
 	if (!app->physical || properties.apiVersion < VK_API_VERSION_1_3 || !device_queue_family(app->physical, &app->family) ||
 	    !device_exports_fences(app->physical)) {
@@ -393,7 +395,7 @@ static void swapchain_device(struct poor_wl_swapchain *swapchain, dev_t device)
 		app_quit(app, 1);
 		return;
 	}
-	snprintf(app->path, sizeof(app->path), "/dev/dri/renderD%u", render_minor);
+	snprintf_array(app->path, "/dev/dri/renderD%u", render_minor);
 	io_uring_prep_openat(need_sqe(poor_loop_get_sqe_or_submit(&app->loop, &app->open_op)), AT_FDCWD, app->path,
 			     O_RDWR | O_CLOEXEC, 0);
 }
@@ -693,8 +695,8 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	poor_loop_fd_init(&app->signals, fd);
 	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
-	io_uring_prep_read(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
-			   &app->siginfo, sizeof(app->siginfo), -1);
+	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
+				 array_ptr(&app->siginfo), -1);
 	return 0;
 }
 

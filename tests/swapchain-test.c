@@ -52,7 +52,7 @@ static void server_config(uint32_t version)
 	swapchain_server.dmabuf_version = version;
 	swapchain_server.main_device = makedev(226, 0);
 	swapchain_server.entries = ARRAY_SIZE(formats);
-	for (unsigned i = 0; i < ARRAY_SIZE(formats); i++) {
+	foreach_array_index(formats, i) {
 		swapchain_server.table[i].format = formats[i];
 		swapchain_server.table[i].padding = 0;
 		swapchain_server.table[i].modifier = modifiers[i];
@@ -74,8 +74,8 @@ static struct client *client_of(struct poor_wl_swapchain *swapchain)
 	return container_of(swapchain, struct client, swapchain);
 }
 
-static int memfd_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t, const uint64_t *modifiers, unsigned count,
-			  bool scanout)
+static int memfd_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t, unsigned count,
+			  const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct client *c = data;
 	int fd;
@@ -86,7 +86,7 @@ static int memfd_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, u
 	fd = memfd_create("swapchain-test", MFD_CLOEXEC);
 	assert(fd >= 0 && !ftruncate(fd, buffer->width * buffer->height * 4));
 	buffer->data = c;
-	buffer->modifier = modifiers[0];
+	buffer->modifier = *array_first_ref(modifiers);
 	buffer->plane_count = 1;
 	buffer->planes[0].fd = fd;
 	buffer->planes[0].offset = 0;
@@ -421,7 +421,7 @@ TEST(explicit_sync)
 	assert(swapchain_server.release_point == swapchain_server.acquire_point + 1);
 	c.fence_fd = fd;
 	client_present(&c, 64, 32, 10);
-	assert(swapchain_server.acquires == 20 && c.allocations <= POOR_WL_SWAPCHAIN_BUFFERS);
+	assert(swapchain_server.acquires == 20 && c.allocations <= ARRAY_SIZE(c.swapchain.buffers));
 	client_stop(&c);
 	server_stop(&loop);
 	poor_loop_close_fd_or_submit(&loop, fd, 0);
@@ -451,13 +451,13 @@ TEST(explicit_sync_waits_for_releases)
 	c.max_frames = 10;
 	poor_wl_swapchain_resize(&c.swapchain, 64, 32);
 	poor_wl_swapchain_request_frame(&c.swapchain);
-	run_until(&loop, swapchain_server.commits == POOR_WL_SWAPCHAIN_BUFFERS);
+	run_until(&loop, swapchain_server.commits == ARRAY_SIZE(c.swapchain.buffers));
 	client_roundtrip(&c);
-	assert(swapchain_server.commits == POOR_WL_SWAPCHAIN_BUFFERS && c.allocations == POOR_WL_SWAPCHAIN_BUFFERS);
+	assert(swapchain_server.commits == ARRAY_SIZE(c.swapchain.buffers) && c.allocations == ARRAY_SIZE(c.swapchain.buffers));
 	swapchain_server.hold_releases = false;
 	swapchain_server_release_held();
 	run_until(&loop, swapchain_server.commits == 10);
-	assert(c.frames == 10 && c.allocations == POOR_WL_SWAPCHAIN_BUFFERS);
+	assert(c.frames == 10 && c.allocations == ARRAY_SIZE(c.swapchain.buffers));
 	client_stop(&c);
 	server_stop(&loop);
 	poor_loop_close_fd_or_submit(&loop, fd, 0);

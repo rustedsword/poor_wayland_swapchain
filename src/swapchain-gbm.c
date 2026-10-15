@@ -7,7 +7,7 @@
 #include <fcntl.h>
 #include <gbm.h>
 #include <poor_loop_fd.h>
-#include <stdio.h>
+#include <poor_stdio.h>
 #include <sys/sysmacros.h>
 
 #include "poor_wayland_swapchain.h"
@@ -34,13 +34,13 @@ static struct io_uring_sqe *gbm_sqe(struct poor_wl_gbm *gbm, struct poor_loop_op
 /* The device link of a node leads to the device in sysfs, which all nodes of a DRM device share */
 static void gbm_stat(struct poor_wl_gbm *gbm)
 {
-	snprintf(gbm->path, sizeof(gbm->path), "/sys/dev/char/%u:%u/device", DRM_MAJOR, gbm->minor);
+	snprintf_array(gbm->path, "/sys/dev/char/%u:%u/device", DRM_MAJOR, gbm->minor);
 	io_uring_prep_statx(gbm_sqe(gbm, &gbm->stat_op), AT_FDCWD, gbm->path, 0, STATX_INO, &gbm->stx);
 }
 
 static void gbm_open_node(struct poor_wl_gbm *gbm)
 {
-	snprintf(gbm->path, sizeof(gbm->path), "/dev/dri/renderD%u", gbm->minor);
+	snprintf_array(gbm->path, "/dev/dri/renderD%u", gbm->minor);
 	io_uring_prep_openat(gbm_sqe(gbm, &gbm->open_op), AT_FDCWD, gbm->path, O_RDWR | O_CLOEXEC, 0);
 }
 
@@ -154,8 +154,8 @@ POOR_WL_EXPORT void poor_wl_gbm_close(struct poor_wl_gbm *gbm)
 }
 
 /* Explicit modifiers are tried first, an implicit one if the compositor takes it */
-static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-			unsigned count, bool scanout)
+static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
+			const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct poor_wl_gbm *gbm = data;
 	uint32_t flags = GBM_BO_USE_RENDERING | (scanout ? GBM_BO_USE_SCANOUT : 0);
@@ -165,11 +165,12 @@ static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uin
 	unsigned n = 0;
 	int planes, ret;
 
-	for (unsigned i = 0; i < count; i++) {
-		if (modifiers[i] == DRM_FORMAT_MOD_INVALID)
+	assert(count <= ARRAY_SIZE(explicit));
+	foreach_array_const_ref(modifiers, modifier) {
+		if (*modifier == DRM_FORMAT_MOD_INVALID)
 			implicit = true;
 		else
-			explicit[n++] = modifiers[i];
+			explicit[n++] = *modifier;
 	}
 	if (n)
 		bo = gbm_bo_create_with_modifiers2(gbm->device, buffer->width, buffer->height, format, explicit, n, flags);
@@ -180,11 +181,11 @@ static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uin
 	if (!bo)
 		return -ENOTSUP;
 	planes = gbm_bo_get_plane_count(bo);
-	if (planes <= 0 || planes > (int)POOR_WL_SWAPCHAIN_PLANES) {
+	if (planes <= 0 || planes > (int)ARRAY_SIZE(buffer->planes)) {
 		gbm_bo_destroy(bo);
 		return -ENOTSUP;
 	}
-	for (int i = 0; i < planes; i++) {
+	foreach_array_index(arrview_first(planes, buffer->planes), i) {
 		buffer->planes[i].fd = gbm_bo_get_fd_for_plane(bo, i);
 		if (buffer->planes[i].fd < 0) {
 			ret = -errno;

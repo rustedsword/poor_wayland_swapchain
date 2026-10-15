@@ -8,6 +8,7 @@ test_runner = static_library(
 	dependencies: [
 		cc.find_library('dl', required: false),
 		dependency('threads'),
+		poor_base_dep,
 	]
 )
 

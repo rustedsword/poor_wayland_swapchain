@@ -54,6 +54,7 @@ client_dep = dependency('poor_wayland_client', fallback: 'poor_wayland', default
 scanner_dep = dependency('poor_wayland_scanner', native: true, fallback: 'poor_wayland', default_options: poor_wayland_options)
 scanner = find_program(scanner_dep.get_variable('poor_wayland_scanner'), native: true)
 poor_loop_dep = dependency('poor_loop')
+poor_base_dep = dependency('poor_base')
 gbm_dep = dependency('gbm')
 # The submodule of wayland-protocols would generate headers for libwayland with wayland-scanner if it found it
 meson.override_dependency('wayland-scanner', dependency('', required: false), native: true)

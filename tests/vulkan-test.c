@@ -83,7 +83,7 @@ static bool vulkan_start(struct client *c, dev_t device)
 		.pNext = &features,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue_info,
-		.enabledExtensionCount = POOR_WL_VULKAN_DEVICE_EXTENSIONS,
+		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
 		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
 	};
 	VkCommandPoolCreateInfo pool_info = {
@@ -165,18 +165,18 @@ static void server_config(struct client *c, dev_t device, int syncobj_fd)
 	swapchain_server.tranches[0].device = device;
 	swapchain_server.tranches[0].flags = 0;
 	swapchain_server.tranches[0].count = n;
-	for (unsigned i = 0; i < n; i++)
+	foreach_array_index(arrview_first(n, swapchain_server.tranches[0].indices), i)
 		swapchain_server.tranches[0].indices[i] = i;
 	swapchain_server.syncobj_fd = syncobj_fd;
 }
 
 static struct target *target_of(struct client *c, struct poor_wl_swapchain_buffer *buffer)
 {
-	return &c->targets[buffer - c->swapchain.buffers];
+	return &c->targets[array_ref_index(c->swapchain.buffers, buffer)];
 }
 
-static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-		    unsigned count, bool scanout)
+static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
+		    const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct client *c = data;
 	struct target *target = target_of(c, buffer);
@@ -193,7 +193,7 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 		.commandBufferCount = 1,
 	};
 	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
-	int ret = poor_wl_vulkan_allocator.allocate(&c->vulkan, buffer, format, modifiers, count, scanout);
+	int ret = poor_wl_vulkan_allocator.allocate(&c->vulkan, buffer, format, count, modifiers, scanout);
 
 	if (ret < 0)
 		return ret;

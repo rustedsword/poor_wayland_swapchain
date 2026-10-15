@@ -415,7 +415,7 @@ static void send_device(struct poor_wl_array *array, dev_t device)
 /* Version 6 has no main device */
 static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *feedback)
 {
-	size_t size = swapchain_server.entries * sizeof(swapchain_server.table[0]);
+	size_t size = swapchain_server.entries * ARRAY_ELEMENT_SIZE(swapchain_server.table);
 	int fd = memfd_create("swapchain-server", MFD_CLOEXEC);
 	char storage[64];
 	struct poor_wl_array array = POOR_WL_ARRAY_INIT(storage);
@@ -432,8 +432,8 @@ static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *fee
 		send_device(&array, tranche->device);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback, &array);
 		array.size = 0;
-		memcpy(poor_wl_array_add(&array, tranche->count * sizeof(tranche->indices[0])), tranche->indices,
-		       tranche->count * sizeof(tranche->indices[0]));
+		memcpy(poor_wl_array_add(&array, tranche->count * ARRAY_ELEMENT_SIZE(tranche->indices)), tranche->indices,
+		       tranche->count * ARRAY_ELEMENT_SIZE(tranche->indices));
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback, &array);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_flags(feedback, tranche->flags);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
@@ -646,9 +646,12 @@ int swapchain_server_connect(void)
 	struct test_client *c = nullptr;
 	int fds[2];
 
-	for (unsigned i = 0; i < MAX_CLIENTS && !c; i++)
-		if (!server.clients[i].used)
-			c = &server.clients[i];
+	foreach_array_ref(server.clients, client) {
+		if (!client->used) {
+			c = client;
+			break;
+		}
+	}
 	assert(c && !socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
 	c->used = true;
 	memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);

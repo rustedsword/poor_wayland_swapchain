@@ -4,11 +4,12 @@
 #include <errno.h>
 #include <poor_loop.h>
 #include <poor_loop_fd.h>
+#include <poor_loop_uring_array.h>
+#include <poor_mman.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/signalfd.h>
 #include <unistd.h>
 
@@ -25,7 +26,7 @@ constexpr int32_t DEFAULT_WIDTH = 640;
 constexpr int32_t DEFAULT_HEIGHT = 480;
 constexpr int32_t MAX_WIDTH = 3840;
 constexpr int32_t MAX_HEIGHT = 2160;
-constexpr int32_t BUFFER_SIZE = MAX_WIDTH * MAX_HEIGHT * 4;
+constexpr unsigned BUFFERS = 2;
 constexpr uint64_t DRAIN_TIMEOUT_NS = 1'000'000'000;
 
 poor_loop_fd_declare(signal_file);
@@ -35,7 +36,7 @@ struct app;
 struct buffer {
 	struct poor_wl_buffer poor_wl_buffer;
 	struct app *app;
-	uint32_t *pixels;
+	uint32_t (*pixels)[MAX_WIDTH * MAX_HEIGHT];
 	int32_t width, height;
 	bool busy;
 };
@@ -52,12 +53,12 @@ struct app {
 	struct poor_xdg_surface shell_surface;
 	struct poor_xdg_toplevel toplevel;
 	struct poor_wl_shm_pool pool;
-	struct buffer buffers[2];
+	struct buffer buffers[BUFFERS];
 	signal_file signals;
 	struct poor_loop_op signal_op, truncate_op;
 	struct signalfd_siginfo siginfo;
 	sigset_t sigset;
-	char *pixels;
+	uint32_t (*pixels)[BUFFERS][MAX_WIDTH * MAX_HEIGHT];
 	int memfd, status;
 	int32_t width, height;
 	uint32_t time;
@@ -87,15 +88,16 @@ static void app_quit(struct app *app, int status)
 	}
 }
 
-static void paint(uint32_t *pixels, int32_t width, int32_t height, uint32_t time)
+static void paint(struct buffer *buffer, uint32_t time)
 {
+	auto rows = arrview_dim(buffer->width, arrview_first(buffer->width * buffer->height, buffer->pixels));
 	uint32_t t = time / 8;
 
-	for (int32_t y = 0; y < height; y++) {
-		for (int32_t x = 0; x < width; x++) {
+	foreach_array_index(rows, y) {
+		foreach_array_index((*rows)[y], x) {
 			uint32_t r = (x + t) & 0xff, g = (y + t / 2) & 0xff, b = ((x ^ y) - t) & 0xff;
 
-			pixels[y * width + x] = 0xff000000 | r << 16 | g << 8 | b;
+			(*rows)[y][x] = 0xff000000 | r << 16 | g << 8 | b;
 		}
 	}
 }
@@ -137,9 +139,12 @@ static void draw(struct app *app)
 {
 	struct buffer *buffer = nullptr;
 
-	for (int i = 0; i < 2 && !buffer; i++)
-		if (!app->buffers[i].busy)
-			buffer = &app->buffers[i];
+	foreach_array_ref(app->buffers, candidate) {
+		if (!candidate->busy) {
+			buffer = candidate;
+			break;
+		}
+	}
 	if (!buffer) {
 		app->draw_pending = true;
 		return;
@@ -147,13 +152,14 @@ static void draw(struct app *app)
 	if (buffer->width != app->width || buffer->height != app->height) {
 		if (buffer->width)
 			poor_wl_buffer_destroy(&buffer->poor_wl_buffer);
-		poor_wl_shm_pool_create_buffer(&app->pool, &buffer->poor_wl_buffer, (buffer - app->buffers) * BUFFER_SIZE, app->width,
+		poor_wl_shm_pool_create_buffer(&app->pool, &buffer->poor_wl_buffer,
+					  array_ref_index(app->buffers, buffer) * ARRAY_SIZE_BYTES(buffer->pixels), app->width,
 					  app->height, app->width * 4, POOR_WL_SHM_FORMAT_XRGB8888);
 		poor_wl_buffer_add_listener(&buffer->poor_wl_buffer, &buffer_listener, buffer);
 		buffer->width = app->width;
 		buffer->height = app->height;
 	}
-	paint(buffer->pixels, buffer->width, buffer->height, app->time);
+	paint(buffer, app->time);
 	poor_wl_surface_attach(&app->surface, &buffer->poor_wl_buffer, 0, 0);
 	poor_wl_surface_damage(&app->surface, 0, 0, INT32_MAX, INT32_MAX);
 	poor_wl_surface_frame(&app->surface, &app->frame);
@@ -213,17 +219,16 @@ static void app_start(struct app *app)
 {
 	if (!app->synced || !app->truncated)
 		return;
-	app->pixels = mmap(nullptr, 2 * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, app->memfd, 0);
-	if (app->pixels == MAP_FAILED) {
+	if (mmap_array(app->pixels, nullptr, PROT_READ | PROT_WRITE, MAP_SHARED, app->memfd, 0) == MAP_FAILED) {
 		app->pixels = nullptr;
 		log_printf("simple-shm: mmap: %s\n", strerror(errno));
 		app_quit(app, 1);
 		return;
 	}
-	poor_wl_shm_create_pool(&app->shm, &app->pool, app->memfd, 2 * BUFFER_SIZE);
+	poor_wl_shm_create_pool(&app->shm, &app->pool, app->memfd, ARRAY_SIZE_BYTES(app->pixels));
 	app->memfd = -1;
-	for (int i = 0; i < 2; i++)
-		app->buffers[i].pixels = (uint32_t *)(app->pixels + i * BUFFER_SIZE);
+	foreach_array_index(app->buffers, i)
+		app->buffers[i].pixels = &(*app->pixels)[i];
 	poor_wl_compositor_create_surface(&app->compositor, &app->surface);
 	poor_xdg_wm_base_get_xdg_surface(&app->wm_base, &app->shell_surface, &app->surface);
 	poor_xdg_surface_add_listener(&app->shell_surface, &shell_surface_listener, app);
@@ -345,10 +350,10 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->time = 0;
 	app->synced = app->truncated = app->frame_pending = app->draw_pending = app->closing = false;
 	app->signals_closed = true;
-	for (int i = 0; i < 2; i++) {
-		app->buffers[i].app = app;
-		app->buffers[i].width = app->buffers[i].height = 0;
-		app->buffers[i].busy = false;
+	foreach_array_ref(app->buffers, buffer) {
+		buffer->app = app;
+		buffer->width = buffer->height = 0;
+		buffer->busy = false;
 	}
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
 		log_printf("simple-shm: can't connect: %s\n", strerror(errno));
@@ -375,11 +380,11 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	poor_loop_fd_init(&app->signals, fd);
 	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
-	io_uring_prep_read(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
-			   &app->siginfo, sizeof(app->siginfo), -1);
+	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
+				 array_ptr(&app->siginfo), -1);
 	poor_loop_op_init(&app->truncate_op, on_truncate);
 	io_uring_prep_ftruncate(need_sqe(poor_loop_get_sqe_or_submit(&app->loop, &app->truncate_op)), app->memfd,
-				2 * (loff_t)BUFFER_SIZE);
+				ARRAY_SIZE_BYTES(app->pixels));
 	return 0;
 }
 
@@ -393,7 +398,7 @@ static int app_finish(struct app *app)
 	if (!ret)
 		ret = poor_loop_drain(&app->loop, poor_loop_now() + DRAIN_TIMEOUT_NS);
 	if (app->pixels)
-		munmap(app->pixels, 2 * BUFFER_SIZE);
+		munmap_array(app->pixels);
 	poor_loop_exit(&app->loop);
 	if (ret) {
 		dprintf(STDERR_FILENO, "simple-shm: io_uring: %s\n", strerror(-ret));

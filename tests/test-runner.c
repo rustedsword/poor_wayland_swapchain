@@ -26,6 +26,8 @@
 
 #define _GNU_SOURCE
 
+#include <poor_stdio.h>
+#include <poor_unistd.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,8 +189,8 @@ set_xdg_runtime_dir(void)
 
 	xrd_env = getenv("XDG_RUNTIME_DIR");
 	/* if XDG_RUNTIME_DIR is not set in environ, fallback to /tmp */
-	assert((snprintf(xdg_runtime_dir, PATH_MAX, "%s/wayland-tests-XXXXXX",
-			 (xrd_env && xrd_env[0] == '/') ? xrd_env : "/tmp") < PATH_MAX)
+	assert(((size_t)snprintf_array(xdg_runtime_dir, "%s/wayland-tests-XXXXXX",
+			 (xrd_env && xrd_env[0] == '/') ? xrd_env : "/tmp") < ARRAY_SIZE(xdg_runtime_dir))
 		&& "test error: XDG_RUNTIME_DIR too long");
 
 	assert(mkdtemp(xdg_runtime_dir) && "test error: mkdtemp failed");
@@ -280,7 +282,7 @@ is_debugger_attached(void)
 
 		/* Wait until parent is ready */
 		close(pipefd[1]);  /* Close unused write end */
-		if (read(pipefd[0], &buf, 1) != 1)
+		if (read_array(pipefd[0], array_ptr(&buf)) != 1)
 			_exit(1);
 		close(pipefd[0]);
 		if (buf == '-')
@@ -304,10 +306,10 @@ is_debugger_attached(void)
 			 * Then flag the error state to the client by sending '-'.
 			 */
 			perror("prctl");
-			(void)!write(pipefd[1], "-", 1);
+			(void)!write_array(pipefd[1], arrview_str("-"));
 		} else {
 			/* Signal to client that parent is ready by passing '+' */
-			(void)!write(pipefd[1], "+", 1);
+			(void)!write_array(pipefd[1], arrview_str("+"));
 		}
 		close(pipefd[1]);
 

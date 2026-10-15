@@ -30,6 +30,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <dirent.h>
+#include <poor_stdio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -124,17 +125,17 @@ void
 exec_fd_leak_check(int nr_expected_fds)
 {
 	const char *exe = "exec-fd-leak-checker";
-	char number[16] = { 0 };
+	char number[16];
 	const char *test_build_dir = getenv("TEST_BUILD_DIR");
-	char exe_path[256] = { 0 };
+	char exe_path[256];
 
 	if (test_build_dir == NULL || test_build_dir[0] == 0) {
 	        test_build_dir = ".";
 	}
 
-	snprintf(exe_path, sizeof exe_path - 1, "%s/%s", test_build_dir, exe);
+	snprintf_array(exe_path, "%s/%s", test_build_dir, exe);
 
-	snprintf(number, sizeof number - 1, "%d", nr_expected_fds);
+	snprintf_array(number, "%d", nr_expected_fds);
 	execl(exe_path, exe, number, (char *)NULL);
 	assert(0 && "execing fd leak checker failed");
 }
