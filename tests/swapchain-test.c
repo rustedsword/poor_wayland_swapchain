@@ -5,7 +5,6 @@
 #include <drm/drm.h>
 #include <drm/drm_fourcc.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <poor_loop_fd.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,10 +16,9 @@
 #include "poor_wayland_client_display.h"
 #include "poor_wayland_swapchain.h"
 #include "swapchain-server.h"
-#include "test-ring.h"
+#include "test-loop.h"
 #include "test-runner.h"
 
-constexpr uint64_t TIMEOUT_NS = 5'000'000'000;
 constexpr uint32_t SCANOUT = POOR_ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT;
 constexpr uint32_t SAMPLING = POOR_ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SAMPLING;
 
@@ -43,36 +41,6 @@ struct client {
 	union poor_wl_map_entry objects[64];
 	union poor_wl_map_entry server_objects[16];
 };
-
-static void watchdog_fire(struct poor_loop *, struct poor_loop_timer *)
-{
-	fprintf(stderr, "loop timed out\n");
-	abort();
-}
-
-static struct poor_loop_timer watchdog = POOR_LOOP_TIMER_INIT(watchdog_fire);
-
-#define run_until(loop, cond) \
-	do { \
-		while (!(cond)) \
-			assert(!poor_loop_run_once(loop)); \
-	} while (0)
-
-static void loop_init(struct poor_loop *loop)
-{
-	struct io_uring_params params = {};
-
-	test_ring_params(&params);
-	assert(!poor_loop_init(loop, 64, &params));
-	poor_loop_timer_arm(loop, &watchdog, poor_loop_now() + TIMEOUT_NS);
-}
-
-static void loop_fini(struct poor_loop *loop)
-{
-	poor_loop_timer_disarm(&watchdog);
-	assert(!poor_loop_drain(loop, poor_loop_now() + TIMEOUT_NS));
-	poor_loop_exit(loop);
-}
 
 /* Formats and modifiers of the table: tranche 0 scans out X tiled XRGB8888, tranche 1 samples the rest */
 static void server_config(uint32_t version)
@@ -429,35 +397,6 @@ TEST(format_without_tranche)
 	loop_fini(&loop);
 }
 
-static bool node_opened;
-static int node_fd;
-
-static void node_open_done(struct poor_loop *, struct poor_loop_op *, const struct io_uring_cqe *cqe)
-{
-	node_fd = cqe->res;
-	node_opened = true;
-}
-
-/* The first render node, if it has timeline syncobjs */
-static int syncobj_device_open(struct poor_loop *loop)
-{
-	struct drm_get_cap cap = { .capability = DRM_CAP_SYNCOBJ_TIMELINE };
-	struct poor_loop_op op;
-	struct io_uring_sqe *sqe;
-
-	poor_loop_op_init(&op, node_open_done);
-	node_opened = false;
-	sqe = poor_loop_get_sqe_or_submit(loop, &op);
-	assert(sqe);
-	io_uring_prep_openat(sqe, AT_FDCWD, "/dev/dri/renderD128", O_RDWR | O_CLOEXEC, 0);
-	run_until(loop, node_opened);
-	if (node_fd >= 0 && (ioctl(node_fd, DRM_IOCTL_GET_CAP, &cap) < 0 || !cap.value)) {
-		poor_loop_close_fd_or_submit(loop, node_fd, 0);
-		return -1;
-	}
-	return node_fd;
-}
-
 /* The compositor sends no releases with explicit synchronization, so buffers come back through the release points */
 TEST(explicit_sync)
 {
@@ -466,7 +405,7 @@ TEST(explicit_sync)
 	int fd;
 
 	loop_init(&loop);
-	fd = syncobj_device_open(&loop);
+	fd = render_node_open(&loop);
 	if (fd < 0) {
 		loop_fini(&loop);
 		return;

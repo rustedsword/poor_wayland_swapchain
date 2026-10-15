@@ -3,8 +3,8 @@
 libpoor_wayland_swapchain presents dmabufs on a
 [poor_wayland](https://github.com/rustedsword/poor_wayland) surface. It follows
 the dmabuf feedback of the surface, gets buffers in the formats and modifiers
-that the compositor prefers from an allocator, GBM on the GPU that the feedback
-names or one of the caller, and tells when to render the next frame. EGL and
+that the compositor prefers from an allocator, GBM or Vulkan on the GPU that the
+feedback names or one of the caller, and tells when to render the next frame. EGL and
 Vulkan can't take poor_wayland's objects for their Wayland platforms, since Mesa
 drives those with the system libwayland, so they render into the buffers of the
 swapchain instead, with explicit synchronization through linux-drm-syncobj-v1 if

@@ -1,0 +1,11 @@
+# Shared by all Vulkan integration tests, including sanitizer builds.
+khronos_validation.validate_core = true
+khronos_validation.check_shaders = true
+khronos_validation.stateless_param = true
+khronos_validation.object_lifetime = true
+khronos_validation.thread_safety = true
+khronos_validation.validate_sync = true
+khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG
+khronos_validation.report_flags = error,warn
+# The runner supplies log_filename through the environment so redirected
+# test logs cannot hide validation errors.

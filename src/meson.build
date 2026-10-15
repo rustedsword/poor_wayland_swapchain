@@ -29,19 +29,28 @@ foreach name, xml : swapchain_xmls
 	)
 endforeach
 
+# The Vulkan images take the functions of the caller, so only the headers are needed
+vulkan_dep = dependency('vulkan', required: false)
+swapchain_sources = client_protocol_h + protocol_c + [ 'swapchain.c', 'swapchain-gbm.c' ]
+swapchain_deps = [ client_dep, gbm_dep, poor_loop_dep ]
+if vulkan_dep.found()
+	swapchain_sources += 'swapchain-vulkan.c'
+	swapchain_deps += vulkan_dep.partial_dependency(compile_args: true, includes: true)
+endif
+
 swapchain = library(
 	'poor_wayland_swapchain',
-	sources: client_protocol_h + protocol_c + [ 'swapchain.c', 'swapchain-gbm.c' ],
+	sources: swapchain_sources,
 	version: meson.project_version(),
 	soversion: '0',
-	dependencies: [ client_dep, gbm_dep, poor_loop_dep ],
+	dependencies: swapchain_deps,
 	install: true
 )
 
 swapchain_dep = declare_dependency(
 	link_with: swapchain,
 	include_directories: include_directories('.'),
-	dependencies: [ client_dep, gbm_dep, poor_loop_dep ],
+	dependencies: swapchain_deps,
 	sources: client_protocol_h
 )
 
@@ -57,3 +66,16 @@ pkgconfig.generate(
 meson.override_dependency('poor_wayland_swapchain', swapchain_dep)
 
 install_headers('poor_wayland_swapchain.h')
+
+if vulkan_dep.found()
+	pkgconfig.generate(
+		name: 'poor_wayland_swapchain_vulkan',
+		description: 'Vulkan images for poor_wayland_swapchain',
+		version: meson.project_version(),
+		filebase: 'poor_wayland_swapchain_vulkan',
+		requires: [ 'poor_wayland_swapchain', 'vulkan' ]
+	)
+	meson.override_dependency('poor_wayland_swapchain_vulkan',
+		declare_dependency(dependencies: [ swapchain_dep, vulkan_dep ]))
+	install_headers('poor_wayland_swapchain_vulkan.h')
+endif

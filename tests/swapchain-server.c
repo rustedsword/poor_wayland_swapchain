@@ -111,11 +111,13 @@ static void syncobj_ioctl(unsigned long request, void *arg)
 	assert(swapchain_server.syncobj_fd >= 0 && !ioctl(swapchain_server.syncobj_fd, request, arg));
 }
 
-static uint64_t syncobj_query(uint32_t syncobj)
+/* The last point with a fence, which may still be pending */
+static uint64_t syncobj_last_point(uint32_t syncobj)
 {
 	uint64_t point;
 	struct drm_syncobj_timeline_array query = {
-		.handles = (uintptr_t)&syncobj, .points = (uintptr_t)&point, .count_handles = 1
+		.handles = (uintptr_t)&syncobj, .points = (uintptr_t)&point, .count_handles = 1,
+		.flags = DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED
 	};
 
 	syncobj_ioctl(DRM_IOCTL_SYNCOBJ_QUERY, &query);
@@ -203,14 +205,14 @@ static void surface_frame(struct poor_wl_client *client, struct poor_wl_surface_
 	surface->frames[surface->frame_count++] = frame;
 }
 
-/* The rendering of the buffer is done by the commit, which the client waits for with explicit synchronization */
+/* By the commit the rendering of the buffer has a fence on the acquire point, which may still be pending */
 static void surface_sync_commit(struct surface_sync *sync, struct buffer *buffer)
 {
 	assert(!buffer == !sync->acquire && !buffer == !sync->release);
 	if (!buffer)
 		return;
 	assert(sync->acquire != sync->release || sync->acquire_point < sync->release_point);
-	assert(syncobj_query(sync->acquire->syncobj) >= sync->acquire_point);
+	assert(syncobj_last_point(sync->acquire->syncobj) >= sync->acquire_point);
 	buffer->release_syncobj = sync->release->syncobj;
 	buffer->release_point = sync->release_point;
 	swapchain_server.acquires++;

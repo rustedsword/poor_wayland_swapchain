@@ -19,7 +19,7 @@
 
 #include "example-log.h"
 #include "poor_wayland_client_display.h"
-#include "poor_wayland_swapchain.h"
+#include "poor_wayland_swapchain_vulkan.h"
 #include "xdg-shell-client-protocol.h"
 
 /*
@@ -32,25 +32,14 @@ constexpr int32_t DEFAULT_WIDTH = 640;
 constexpr int32_t DEFAULT_HEIGHT = 480;
 constexpr uint64_t DRAIN_TIMEOUT_NS = 1'000'000'000;
 constexpr VkFormat FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
-constexpr unsigned DRIVER_MODIFIERS = 128;
-
-static const char *const device_extensions[] = {
-	VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
-	VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-	VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-	VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
-	VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-	VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
-};
 
 poor_loop_fd_declare(signal_file);
 
-/* What a buffer of the swapchain is drawn into */
+/* How the image of a buffer of the swapchain is drawn */
 struct target {
-	VkImage image;
-	VkDeviceMemory memory;
 	VkImageView view;
 	VkCommandBuffer commands;
+	VkFence done;
 };
 
 struct app {
@@ -66,6 +55,7 @@ struct app {
 	struct poor_xdg_surface shell_surface;
 	struct poor_xdg_toplevel toplevel;
 	struct poor_wl_swapchain swapchain;
+	struct poor_wl_vulkan vulkan;
 	struct target targets[POOR_WL_SWAPCHAIN_BUFFERS];
 	VkInstance instance;
 	VkPhysicalDevice physical;
@@ -73,9 +63,8 @@ struct app {
 	VkQueue queue;
 	VkCommandPool pool;
 	VkSemaphore rendered, idle;
-	PFN_vkGetMemoryFdKHR get_memory_fd;
+	VkFence drained;
 	PFN_vkGetSemaphoreFdKHR get_semaphore_fd;
-	PFN_vkGetImageDrmFormatModifierPropertiesEXT get_image_modifier;
 	uint32_t family;
 	struct poor_loop_op open_op, idle_op;
 	int drm_fd, idle_fd;
@@ -121,6 +110,7 @@ static void app_teardown(struct app *app)
 	if (app->swapchain_started)
 		poor_wl_swapchain_destroy(&app->swapchain, swapchain_done);
 	if (app->device) {
+		vkDestroyFence(app->device, app->drained, nullptr);
 		vkDestroySemaphore(app->device, app->idle, nullptr);
 		vkDestroySemaphore(app->device, app->rendered, nullptr);
 		vkDestroyCommandPool(app->device, app->pool, nullptr);
@@ -135,11 +125,13 @@ static void app_teardown(struct app *app)
 		io_uring_prep_cancel(need_sqe(poor_loop_get_untracked_sqe_or_submit(&app->loop)), &app->signal_op, 0);
 }
 
+/* Vulkan learns from the fence of the empty batch that all drawing is done */
 static void on_idle(struct poor_loop *, struct poor_loop_op *op, const struct io_uring_cqe *)
 {
 	struct app *app = container_of(op, struct app, idle_op);
 
 	poor_loop_close_fd_or_submit(&app->loop, app->idle_fd, 0);
+	vkGetFenceStatus(app->device, app->drained);
 	app_teardown(app);
 }
 
@@ -151,7 +143,12 @@ static int idle_fence(struct app *app)
 		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
 	};
 	VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
-	VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .signalSemaphoreCount = 1, .pSignalSemaphores = &app->idle };
+	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	VkSubmitInfo submit = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &app->idle,
+	};
 	VkSemaphoreGetFdInfoKHR get = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
 		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
@@ -159,7 +156,8 @@ static int idle_fence(struct app *app)
 	int fd = -1;
 
 	if (!check(vkCreateSemaphore(app->device, &info, nullptr, &app->idle), "vkCreateSemaphore") ||
-	    !check(vkQueueSubmit(app->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit"))
+	    !check(vkCreateFence(app->device, &fence_info, nullptr, &app->drained), "vkCreateFence") ||
+	    !check(vkQueueSubmit(app->queue, 1, &submit, app->drained), "vkQueueSubmit"))
 		return -1;
 	get.semaphore = app->idle;
 	check(app->get_semaphore_fd(app->device, &get, &fd), "vkGetSemaphoreFdKHR");
@@ -191,85 +189,22 @@ static struct target *target_of(struct app *app, struct poor_wl_swapchain_buffer
 	return &app->targets[buffer - app->swapchain.buffers];
 }
 
+/* The last drawing is done by then, which Vulkan learns from the fence */
 static void target_fini(struct app *app, struct target *target)
 {
+	if (target->done)
+		vkGetFenceStatus(app->device, target->done);
 	if (target->commands)
 		vkFreeCommandBuffers(app->device, app->pool, 1, &target->commands);
+	vkDestroyFence(app->device, target->done, nullptr);
 	vkDestroyImageView(app->device, target->view, nullptr);
-	vkDestroyImage(app->device, target->image, nullptr);
-	vkFreeMemory(app->device, target->memory, nullptr);
 }
 
-static bool exportable(struct app *app, uint64_t modifier, const struct poor_wl_swapchain_buffer *buffer)
+static bool target_init(struct app *app, struct target *target, VkImage image)
 {
-	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-		.drmFormatModifier = modifier,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	};
-	VkPhysicalDeviceExternalImageFormatInfo external_info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-		.pNext = &modifier_info,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkPhysicalDeviceImageFormatInfo2 info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-		.pNext = &external_info,
-		.format = FORMAT,
-		.type = VK_IMAGE_TYPE_2D,
-		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-	};
-	VkExternalImageFormatProperties external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
-	VkImageFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &external };
-
-	return vkGetPhysicalDeviceImageFormatProperties2(app->physical, &info, &properties) == VK_SUCCESS &&
-	       external.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT &&
-	       (uint32_t)buffer->width <= properties.imageFormatProperties.maxExtent.width &&
-	       (uint32_t)buffer->height <= properties.imageFormatProperties.maxExtent.height;
-}
-
-/* The modifiers of the tranche that the driver draws into and shares, with their numbers of memory planes */
-static unsigned usable_modifiers(struct app *app, const struct poor_wl_swapchain_buffer *buffer, const uint64_t *modifiers,
-				 unsigned count, uint64_t *usable, uint32_t *planes)
-{
-	static VkDrmFormatModifierPropertiesEXT driver[DRIVER_MODIFIERS];
-	VkDrmFormatModifierPropertiesListEXT list = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-		.drmFormatModifierCount = DRIVER_MODIFIERS,
-		.pDrmFormatModifierProperties = driver,
-	};
-	VkFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list };
-	unsigned n = 0;
-
-	vkGetPhysicalDeviceFormatProperties2(app->physical, FORMAT, &properties);
-	for (unsigned i = 0; i < count; i++) {
-		for (uint32_t j = 0; j < list.drmFormatModifierCount; j++) {
-			if (driver[j].drmFormatModifier != modifiers[i] ||
-			    !(driver[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ||
-			    driver[j].drmFormatModifierPlaneCount > POOR_WL_SWAPCHAIN_PLANES || !exportable(app, modifiers[i], buffer))
-				continue;
-			usable[n] = modifiers[i];
-			planes[n++] = driver[j].drmFormatModifierPlaneCount;
-		}
-	}
-	return n;
-}
-
-/* Device local memory if there is, the image has the memory for itself */
-static bool target_init(struct app *app, struct target *target, const VkImageCreateInfo *image_info)
-{
-	VkPhysicalDeviceMemoryProperties memory_properties;
-	VkMemoryRequirements requirements;
-	VkMemoryDedicatedAllocateInfo dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-	VkExportMemoryAllocateInfo export = {
-		.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-		.pNext = &dedicated,
-		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkMemoryAllocateInfo memory_info = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export };
 	VkImageViewCreateInfo view_info = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = image,
 		.viewType = VK_IMAGE_VIEW_TYPE_2D,
 		.format = FORMAT,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
@@ -280,166 +215,48 @@ static bool target_init(struct app *app, struct target *target, const VkImageCre
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		.commandBufferCount = 1,
 	};
-	uint32_t type = UINT32_MAX;
+	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
 
-	target->image = VK_NULL_HANDLE;
-	target->memory = VK_NULL_HANDLE;
 	target->view = VK_NULL_HANDLE;
 	target->commands = VK_NULL_HANDLE;
-	if (!check(vkCreateImage(app->device, image_info, nullptr, &target->image), "vkCreateImage"))
-		return false;
-	vkGetImageMemoryRequirements(app->device, target->image, &requirements);
-	vkGetPhysicalDeviceMemoryProperties(app->physical, &memory_properties);
-	for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
-		if (!(requirements.memoryTypeBits & 1u << i))
-			continue;
-		if (type == UINT32_MAX || memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-			type = i;
-		if (memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-			break;
-	}
-	if (type == UINT32_MAX)
-		return false;
-	dedicated.image = target->image;
-	memory_info.allocationSize = requirements.size;
-	memory_info.memoryTypeIndex = type;
-	view_info.image = target->image;
-	return check(vkAllocateMemory(app->device, &memory_info, nullptr, &target->memory), "vkAllocateMemory") &&
-	       check(vkBindImageMemory(app->device, target->image, target->memory, 0), "vkBindImageMemory") &&
-	       check(vkCreateImageView(app->device, &view_info, nullptr, &target->view), "vkCreateImageView") &&
-	       check(vkAllocateCommandBuffers(app->device, &commands_info, &target->commands), "vkAllocateCommandBuffers");
+	target->done = VK_NULL_HANDLE;
+	return check(vkCreateImageView(app->device, &view_info, nullptr, &target->view), "vkCreateImageView") &&
+	       check(vkAllocateCommandBuffers(app->device, &commands_info, &target->commands), "vkAllocateCommandBuffers") &&
+	       check(vkCreateFence(app->device, &fence_info, nullptr, &target->done), "vkCreateFence");
 }
 
-/* The memory planes share the memory, each with an fd of its own */
-static bool target_export(struct app *app, struct target *target, struct poor_wl_swapchain_buffer *buffer, uint32_t planes)
-{
-	VkMemoryGetFdInfoKHR get = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-		.memory = target->memory,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkSubresourceLayout layout;
-	uint32_t i;
-
-	for (i = 0; i < planes; i++) {
-		VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i };
-
-		if (!check(app->get_memory_fd(app->device, &get, &buffer->planes[i].fd), "vkGetMemoryFdKHR"))
-			break;
-		vkGetImageSubresourceLayout(app->device, target->image, &subresource, &layout);
-		buffer->planes[i].offset = layout.offset;
-		buffer->planes[i].stride = layout.rowPitch;
-	}
-	if (i == planes) {
-		buffer->plane_count = planes;
-		return true;
-	}
-	while (i--)
-		poor_loop_close_fd_or_submit(&app->loop, buffer->planes[i].fd, 0);
-	return false;
-}
-
-/* Vulkan picks one of the modifiers, and each memory plane of the image becomes a plane of the buffer */
+/* poor_wl_vulkan allocates, the targets come and go with the buffers */
 static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, const uint64_t *modifiers,
-		    unsigned count, bool)
+		    unsigned count, bool scanout)
 {
 	struct app *app = data;
 	struct target *target = target_of(app, buffer);
-	uint64_t usable[POOR_WL_SWAPCHAIN_MODIFIERS];
-	uint32_t planes[POOR_WL_SWAPCHAIN_MODIFIERS];
-	unsigned n = usable_modifiers(app, buffer, modifiers, count, usable, planes), i;
-	VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-		.drmFormatModifierCount = n,
-		.pDrmFormatModifiers = usable,
-	};
-	VkExternalMemoryImageCreateInfo external = {
-		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-		.pNext = &modifier_list,
-		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkImageCreateInfo image_info = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-		.pNext = &external,
-		.imageType = VK_IMAGE_TYPE_2D,
-		.format = FORMAT,
-		.extent = { (uint32_t)buffer->width, (uint32_t)buffer->height, 1 },
-		.mipLevels = 1,
-		.arrayLayers = 1,
-		.samples = VK_SAMPLE_COUNT_1_BIT,
-		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-	VkImageDrmFormatModifierPropertiesEXT chosen = { .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
+	int ret = poor_wl_vulkan_allocator.allocate(&app->vulkan, buffer, format, modifiers, count, scanout);
 
-	assert(format == DRM_FORMAT_XRGB8888);
-	if (!n)
-		return -ENOTSUP;
-	if (!target_init(app, target, &image_info) ||
-	    !check(app->get_image_modifier(app->device, target->image, &chosen), "vkGetImageDrmFormatModifierPropertiesEXT")) {
+	if (ret < 0)
+		return ret;
+	if (!target_init(app, target, ((struct poor_wl_vulkan_image *)buffer->data)->image)) {
 		target_fini(app, target);
-		return -ENOTSUP;
+		for (unsigned i = 0; i < buffer->plane_count; i++)
+			poor_loop_close_fd_or_submit(&app->loop, buffer->planes[i].fd, 0);
+		poor_wl_vulkan_allocator.free(&app->vulkan, buffer);
+		return -ENOMEM;
 	}
-	for (i = 0; i < n && usable[i] != chosen.drmFormatModifier; i++)
-		;
-	assert(i < n);
-	if (!target_export(app, target, buffer, planes[i])) {
-		target_fini(app, target);
-		return -ENOTSUP;
-	}
-	buffer->modifier = chosen.drmFormatModifier;
-	buffer->data = target;
 	return 0;
 }
 
 static void free_buffer(void *data, struct poor_wl_swapchain_buffer *buffer)
 {
-	target_fini(data, buffer->data);
+	struct app *app = data;
+
+	target_fini(app, target_of(app, buffer));
+	poor_wl_vulkan_allocator.free(&app->vulkan, buffer);
 }
 
 static const struct poor_wl_swapchain_allocator allocator = {
 	.allocate = allocate,
 	.free = free_buffer,
 };
-
-static bool has_extensions(VkPhysicalDevice physical)
-{
-	static VkExtensionProperties properties[512];
-	uint32_t count = ARRAY_SIZE(properties);
-	unsigned found = 0;
-
-	if (vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, properties) < 0)
-		return false;
-	for (unsigned i = 0; i < ARRAY_SIZE(device_extensions); i++) {
-		for (uint32_t j = 0; j < count; j++) {
-			if (!strcmp(device_extensions[i], properties[j].extensionName)) {
-				found++;
-				break;
-			}
-		}
-	}
-	return found == ARRAY_SIZE(device_extensions);
-}
-
-/* The device of the feedback may be the primary node or the render node of the GPU */
-static bool device_is(struct app *app, VkPhysicalDevice physical, dev_t device, unsigned *render_minor)
-{
-	VkPhysicalDeviceDrmPropertiesEXT drm = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT };
-	VkPhysicalDeviceProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drm };
-
-	if (!has_extensions(physical))
-		return false;
-	vkGetPhysicalDeviceProperties2(physical, &properties);
-	if (properties.properties.apiVersion < VK_API_VERSION_1_3 || !drm.hasRender ||
-	    !((drm.hasPrimary && major(device) == drm.primaryMajor && minor(device) == drm.primaryMinor) ||
-	      (major(device) == drm.renderMajor && minor(device) == drm.renderMinor)))
-		return false;
-	*render_minor = drm.renderMinor;
-	memcpy(app->device_name, properties.properties.deviceName, sizeof(app->device_name));
-	return true;
-}
 
 static bool device_queue_family(VkPhysicalDevice physical, uint32_t *family)
 {
@@ -476,7 +293,10 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		.pApplicationName = "simple-vulkan",
 		.apiVersion = VK_API_VERSION_1_3,
 	};
-	VkInstanceCreateInfo instance_info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &application };
+	VkInstanceCreateInfo instance_info = {
+		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.pApplicationInfo = &application,
+	};
 	VkPhysicalDeviceVulkan13Features features = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
 		.dynamicRendering = VK_TRUE,
@@ -491,8 +311,8 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		.pNext = &features,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue_info,
-		.enabledExtensionCount = ARRAY_SIZE(device_extensions),
-		.ppEnabledExtensionNames = device_extensions,
+		.enabledExtensionCount = POOR_WL_VULKAN_DEVICE_EXTENSIONS,
+		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
 	};
 	VkCommandPoolCreateInfo pool_info = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -503,18 +323,19 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
 	};
 	VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
-	VkPhysicalDevice physicals[16];
-	uint32_t count = ARRAY_SIZE(physicals);
+	VkPhysicalDeviceProperties properties;
 
 	/* Mesa's device-select layer would connect to the compositor with the system libwayland and block, to sort GPUs */
 	setenv("NODEVICE_SELECT", "1", 1);
-	if (!check(vkCreateInstance(&instance_info, nullptr, &app->instance), "vkCreateInstance") ||
-	    !check(vkEnumeratePhysicalDevices(app->instance, &count, physicals), "vkEnumeratePhysicalDevices"))
+	if (!check(vkCreateInstance(&instance_info, nullptr, &app->instance), "vkCreateInstance"))
 		return false;
-	for (uint32_t i = 0; i < count && !app->physical; i++)
-		if (device_is(app, physicals[i], device, render_minor))
-			app->physical = physicals[i];
-	if (!app->physical || !device_queue_family(app->physical, &app->family) || !device_exports_fences(app->physical)) {
+	app->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, app->instance, device, render_minor);
+	if (app->physical) {
+		vkGetPhysicalDeviceProperties(app->physical, &properties);
+		memcpy(app->device_name, properties.deviceName, sizeof(app->device_name));
+	}
+	if (!app->physical || properties.apiVersion < VK_API_VERSION_1_3 || !device_queue_family(app->physical, &app->family) ||
+	    !device_exports_fences(app->physical)) {
 		log_printf("simple-vulkan: no Vulkan 1.3 device with dmabufs, modifiers and fences for %u:%u\n", major(device),
 			   minor(device));
 		return false;
@@ -524,10 +345,9 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 	if (!check(vkCreateDevice(app->physical, &device_info, nullptr, &app->device), "vkCreateDevice"))
 		return false;
 	vkGetDeviceQueue(app->device, app->family, 0, &app->queue);
-	app->get_memory_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(app->device, "vkGetMemoryFdKHR");
 	app->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(app->device, "vkGetSemaphoreFdKHR");
-	app->get_image_modifier = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)vkGetDeviceProcAddr(
-		app->device, "vkGetImageDrmFormatModifierPropertiesEXT");
+	poor_wl_vulkan_init(&app->vulkan, &app->loop, vkGetInstanceProcAddr, app->instance, app->physical, app->device, FORMAT,
+			    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 	return check(vkCreateCommandPool(app->device, &pool_info, nullptr, &app->pool), "vkCreateCommandPool") &&
 	       check(vkCreateSemaphore(app->device, &semaphore_info, nullptr, &app->rendered), "vkCreateSemaphore");
 }
@@ -601,12 +421,14 @@ static VkClearColorValue hue(uint32_t time)
 
 /*
  * The old contents of the image don't matter. It goes to the queue family of the compositor, which reads it once
- * the fence of the batch signals. The compositor was done with the buffer, and so was the last batch that drew it.
+ * the fence of the batch signals. The compositor was done with the buffer, and so was the last batch that drew it,
+ * which Vulkan learns from the fence of that batch.
  */
 static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t time)
 {
 	struct app *app = app_of_swapchain(swapchain);
-	struct target *target = buffer->data;
+	struct target *target = target_of(app, buffer);
+	VkImage image = ((struct poor_wl_vulkan_image *)buffer->data)->image;
 	VkCommandBufferBeginInfo begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -618,7 +440,7 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		.image = target->image,
+		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
 	VkImageMemoryBarrier release = {
@@ -628,7 +450,7 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
 		.srcQueueFamilyIndex = app->family,
 		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
-		.image = target->image,
+		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
 	VkRenderingAttachmentInfo attachment = {
@@ -662,18 +484,24 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 
 	if (app->closing)
 		return;
-	if (!check(vkBeginCommandBuffer(target->commands, &begin), "vkBeginCommandBuffer")) {
+	if (vkGetFenceStatus(app->device, target->done) != VK_SUCCESS) {
+		log_printf("simple-vulkan: a buffer came back before its drawing was done\n");
 		app_quit(app, 1);
 		return;
 	}
-	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
-			     nullptr, 0, nullptr, 1, &draw);
+	if (!check(vkResetFences(app->device, 1, &target->done), "vkResetFences") ||
+	    !check(vkBeginCommandBuffer(target->commands, &begin), "vkBeginCommandBuffer")) {
+		app_quit(app, 1);
+		return;
+	}
+	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &draw);
 	vkCmdBeginRendering(target->commands, &rendering);
 	vkCmdEndRendering(target->commands);
-	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-			     0, 0, nullptr, 0, nullptr, 1, &release);
+	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
 	if (!check(vkEndCommandBuffer(target->commands), "vkEndCommandBuffer") ||
-	    !check(vkQueueSubmit(app->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit") ||
+	    !check(vkQueueSubmit(app->queue, 1, &submit, target->done), "vkQueueSubmit") ||
 	    !check(app->get_semaphore_fd(app->device, &get, &fence), "vkGetSemaphoreFdKHR")) {
 		app_quit(app, 1);
 		return;
@@ -836,6 +664,7 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->queue = nullptr;
 	app->pool = VK_NULL_HANDLE;
 	app->rendered = app->idle = VK_NULL_HANDLE;
+	app->drained = VK_NULL_HANDLE;
 	app->drm_fd = app->idle_fd = -1;
 	poor_loop_op_init(&app->open_op, on_open);
 	poor_loop_op_init(&app->idle_op, on_idle);
