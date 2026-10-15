@@ -221,7 +221,6 @@ static void app_start(struct app *app)
 		return;
 	}
 	poor_wl_shm_create_pool(&app->shm, &app->pool, app->memfd, 2 * BUFFER_SIZE);
-	poor_loop_close_fd_or_submit(&app->loop, app->memfd, 0);
 	app->memfd = -1;
 	for (int i = 0; i < 2; i++)
 		app->buffers[i].pixels = (uint32_t *)(app->pixels + i * BUFFER_SIZE);

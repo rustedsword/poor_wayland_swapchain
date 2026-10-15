@@ -37,7 +37,7 @@ struct poor_wl_swapchain_plane {
 	uint32_t stride;
 };
 
-/* The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain closes the fds of the planes. */
+/* The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes. */
 struct poor_wl_swapchain_buffer {
 	struct poor_wl_buffer buffer;
 	struct poor_wp_linux_drm_syncobj_timeline_v1 timeline;

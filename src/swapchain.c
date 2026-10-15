@@ -100,7 +100,6 @@ static int buffer_timeline_init(struct poor_wl_swapchain *swapchain, struct poor
 		return ret;
 	}
 	poor_wp_linux_drm_syncobj_manager_v1_import_timeline(swapchain->syncobj_manager, &buffer->timeline, export.fd);
-	poor_loop_close_fd_or_submit(swapchain->loop, export.fd, 0);
 	buffer->point = 0;
 	return 0;
 }
@@ -290,7 +289,6 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 	for (unsigned i = 0; i < buffer->plane_count; i++) {
 		poor_zwp_linux_buffer_params_v1_add(&swapchain->params, buffer->planes[i].fd, i, buffer->planes[i].offset,
 						    buffer->planes[i].stride, buffer->modifier >> 32, buffer->modifier & 0xffffffff);
-		poor_loop_close_fd_or_submit(swapchain->loop, buffer->planes[i].fd, 0);
 		buffer->planes[i].fd = -1;
 	}
 	poor_zwp_linux_buffer_params_v1_create_immed(&swapchain->params, &buffer->buffer, buffer->width, buffer->height,

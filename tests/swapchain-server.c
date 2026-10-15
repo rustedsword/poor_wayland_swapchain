@@ -422,7 +422,6 @@ static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *fee
 
 	assert(fd >= 0 && write(fd, swapchain_server.table, size) == (ssize_t)size);
 	poor_zwp_linux_dmabuf_feedback_v1_send_format_table(feedback, fd, size);
-	poor_loop_close_fd_or_submit(server.loop, fd, 0);
 	if (poor_wl_resource_get_version(&feedback->resource) < 6) {
 		send_device(&array, swapchain_server.main_device);
 		poor_zwp_linux_dmabuf_feedback_v1_send_main_device(feedback, &array);
