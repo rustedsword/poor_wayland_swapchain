@@ -26,7 +26,7 @@ static bool has_extensions(PFN_vkEnumerateDeviceExtensionProperties enumerate, V
 	VkExtensionProperties properties[DEVICE_EXTENSIONS];
 	uint32_t count = ARRAY_SIZE(properties), found = 0;
 
-	if (enumerate(physical, nullptr, &count, properties) < 0 || !count)
+	if (enumerate(physical, nullptr, &count, properties) < 0)
 		return false;
 	foreach_array_const_ref(poor_wl_vulkan_device_extensions, extension) {
 		foreach_array_const_ref(arrview_first(count, properties), listed) {
@@ -51,7 +51,7 @@ POOR_WL_EXPORT VkPhysicalDevice poor_wl_vulkan_find_device(PFN_vkGetInstanceProc
 	VkPhysicalDevice physicals[16];
 	uint32_t count = ARRAY_SIZE(physicals);
 
-	if (enumerate_devices(instance, &count, physicals) < 0 || !count)
+	if (enumerate_devices(instance, &count, physicals) < 0)
 		return VK_NULL_HANDLE;
 	foreach_array_const_ref(arrview_first(count, physicals), physical) {
 		VkPhysicalDeviceDrmPropertiesEXT drm = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT };
@@ -159,8 +159,6 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 	unsigned n = 0;
 
 	vulkan->get_format_properties(vulkan->physical, vulkan->format, &properties);
-	if (!list.drmFormatModifierCount)
-		return 0;
 	foreach_array_const_ref(modifiers, modifier) {
 		foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
 			if (listed->drmFormatModifier != *modifier ||
@@ -243,8 +241,8 @@ static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulka
 
 		result = vulkan->get_memory_fd(vulkan->device, &get, &buffer->planes[i].fd);
 		if (result != VK_SUCCESS) {
-			while (i--)
-				poor_loop_close_fd_or_submit(vulkan->loop, buffer->planes[i].fd, 0);
+			foreach_array_const_ref(arrview_first(i, buffer->planes), plane)
+				poor_loop_close_fd_or_submit(vulkan->loop, plane->fd, 0);
 			return result;
 		}
 		vulkan->get_subresource_layout(vulkan->device, image->image, &subresource, &layout);
@@ -263,7 +261,7 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 	struct poor_wl_vulkan_image *image = &vulkan->images[array_ref_index(buffer->swapchain->buffers, buffer)];
 	uint64_t usable[POOR_WL_SWAPCHAIN_MODIFIERS];
 	uint32_t planes[POOR_WL_SWAPCHAIN_MODIFIERS];
-	unsigned n, i;
+	unsigned n;
 
 	assert(count <= ARRAY_SIZE(usable));
 	n = usable_modifiers(vulkan, buffer, count, modifiers, arrview_first(count, usable), arrview_first(count, planes));
@@ -300,16 +298,17 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 		image_fini(vulkan, image);
 		return -ENOMEM;
 	}
-	for (i = 0; i < n && usable[i] != chosen.drmFormatModifier; i++)
-		;
-	assert(i < n);
-	if (image_export(vulkan, image, buffer, planes[i]) != VK_SUCCESS) {
-		image_fini(vulkan, image);
-		return -ENOMEM;
+	foreach_array_index(arrview_first(n, usable), i) {
+		if (usable[i] != chosen.drmFormatModifier)
+			continue;
+		if (image_export(vulkan, image, buffer, planes[i]) != VK_SUCCESS)
+			break;
+		buffer->modifier = chosen.drmFormatModifier;
+		buffer->data = image;
+		return 0;
 	}
-	buffer->modifier = chosen.drmFormatModifier;
-	buffer->data = image;
-	return 0;
+	image_fini(vulkan, image);
+	return -ENOMEM;
 }
 
 static void vulkan_free(void *data, struct poor_wl_swapchain_buffer *buffer)

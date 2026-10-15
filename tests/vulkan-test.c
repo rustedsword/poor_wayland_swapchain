@@ -110,8 +110,13 @@ static bool vulkan_start(struct client *c, dev_t device)
 	}
 	assert(render_minor == minor(device));
 	vkGetPhysicalDeviceQueueFamilyProperties(c->physical, &count, families);
-	for (c->family = 0; c->family < count && !(families[c->family].queueFlags & VK_QUEUE_GRAPHICS_BIT); c->family++)
-		;
+	c->family = count;
+	foreach_array_index(arrview_first(count, families), i) {
+		if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+			c->family = i;
+			break;
+		}
+	}
 	assert(c->family < count);
 	queue_info.queueFamilyIndex = c->family;
 	pool_info.queueFamilyIndex = c->family;
@@ -147,13 +152,15 @@ static void server_config(struct client *c, dev_t device, int syncobj_fd)
 	unsigned n = 0;
 
 	vkGetPhysicalDeviceFormatProperties2(c->physical, FORMAT, &properties);
-	for (uint32_t i = 0; i < list.drmFormatModifierCount && n < ARRAY_SIZE(swapchain_server.table) - 1; i++) {
-		if (driver[i].drmFormatModifier == DRM_FORMAT_MOD_LINEAR ||
-		    !(driver[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+	foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
+		if (n == ARRAY_SIZE(swapchain_server.table) - 1)
+			break;
+		if (listed->drmFormatModifier == DRM_FORMAT_MOD_LINEAR ||
+		    !(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
 			continue;
 		swapchain_server.table[n].format = DRM_FORMAT_XRGB8888;
 		swapchain_server.table[n].padding = 0;
-		swapchain_server.table[n++].modifier = driver[i].drmFormatModifier;
+		swapchain_server.table[n++].modifier = listed->drmFormatModifier;
 	}
 	swapchain_server.table[n].format = DRM_FORMAT_XRGB8888;
 	swapchain_server.table[n].padding = 0;

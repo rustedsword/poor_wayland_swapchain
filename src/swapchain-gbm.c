@@ -189,8 +189,8 @@ static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uin
 		buffer->planes[i].fd = gbm_bo_get_fd_for_plane(bo, i);
 		if (buffer->planes[i].fd < 0) {
 			ret = -errno;
-			while (i--)
-				poor_loop_close_fd_or_submit(gbm->loop, buffer->planes[i].fd, 0);
+			foreach_array_const_ref(arrview_first(i, buffer->planes), plane)
+				poor_loop_close_fd_or_submit(gbm->loop, plane->fd, 0);
 			gbm_bo_destroy(bo);
 			return ret;
 		}

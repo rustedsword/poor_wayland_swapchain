@@ -21,8 +21,8 @@ static void keep_loaded(void)
 {
 	keep_loaded_count = 0;
 	dl_iterate_phdr(keep_loaded_collect, nullptr);
-	for (unsigned i = 0; i < keep_loaded_count; i++)
-		dlopen(keep_loaded_names[i], RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+	foreach_array_const_ref(arrview_first(keep_loaded_count, keep_loaded_names), name)
+		dlopen(*name, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
 }
 
 #endif

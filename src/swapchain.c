@@ -249,10 +249,7 @@ static const struct poor_wl_buffer_listener buffer_listener = {
 	.release = buffer_release,
 };
 
-/*
- * The tranches come in the order that the compositor prefers, the first one that the allocator manages is used. A
- * stored tranche has modifiers, and there is one at least when buffers are allocated.
- */
+/* The tranches come in the order that the compositor prefers, the first one that the allocator manages is used */
 static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer)
 {
 	const struct poor_wl_swapchain_tranche *tranche = nullptr;

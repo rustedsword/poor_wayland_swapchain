@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <drm/drm.h>
 #include <poor_loop_fd.h>
+#include <poor_unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -164,10 +165,12 @@ static void frame_destroy(struct poor_wl_resource *resource)
 	struct frame *frame = container_of(resource, struct frame, resource.resource);
 	struct surface *surface = frame->surface;
 
-	for (unsigned i = 0; surface && i < surface->frame_count; i++) {
-		if (surface->frames[i] == frame) {
-			surface->frames[i] = surface->frames[--surface->frame_count];
-			break;
+	if (surface) {
+		foreach_array_ref(arrview_first(surface->frame_count, surface->frames), queued) {
+			if (*queued == frame) {
+				*queued = surface->frames[--surface->frame_count];
+				break;
+			}
 		}
 	}
 	free(frame);
@@ -242,7 +245,7 @@ static void surface_commit(struct poor_wl_client *, struct poor_wl_surface_resou
 {
 	struct surface *surface = container_of(resource, struct surface, resource);
 	struct buffer *buffer = surface->pending;
-	unsigned count = surface->frame_count;
+	auto frames = arrview_first(surface->frame_count, surface->frames);
 
 	swapchain_server.commits++;
 	if (surface->sync)
@@ -268,10 +271,10 @@ static void surface_commit(struct poor_wl_client *, struct poor_wl_surface_resou
 		swapchain_server.sampling_device = buffer->sampling_device;
 	}
 	surface->frame_count = 0;
-	for (unsigned i = 0; i < count; i++) {
-		surface->frames[i]->surface = nullptr;
-		poor_wl_callback_send_done(&surface->frames[i]->resource, swapchain_server.commits);
-		poor_wl_resource_destroy(&surface->frames[i]->resource.resource);
+	foreach_array_const_ref(frames, frame) {
+		(*frame)->surface = nullptr;
+		poor_wl_callback_send_done(&(*frame)->resource, swapchain_server.commits);
+		poor_wl_resource_destroy(&(*frame)->resource.resource);
 	}
 }
 
@@ -294,8 +297,8 @@ static void surface_destroy(struct poor_wl_resource *resource)
 		surface->current->current_on = nullptr;
 	if (surface->sync)
 		surface->sync->surface = nullptr;
-	for (unsigned i = 0; i < surface->frame_count; i++)
-		surface->frames[i]->surface = nullptr;
+	foreach_array_const_ref(arrview_first(surface->frame_count, surface->frames), frame)
+		(*frame)->surface = nullptr;
 	free(surface);
 }
 
@@ -415,25 +418,24 @@ static void send_device(struct poor_wl_array *array, dev_t device)
 /* Version 6 has no main device */
 static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *feedback)
 {
-	size_t size = swapchain_server.entries * ARRAY_ELEMENT_SIZE(swapchain_server.table);
+	auto table = arrview_first(swapchain_server.entries, swapchain_server.table);
 	int fd = memfd_create("swapchain-server", MFD_CLOEXEC);
 	char storage[64];
 	struct poor_wl_array array = POOR_WL_ARRAY_INIT(storage);
 
-	assert(fd >= 0 && write(fd, swapchain_server.table, size) == (ssize_t)size);
-	poor_zwp_linux_dmabuf_feedback_v1_send_format_table(feedback, fd, size);
+	assert(fd >= 0 && write_array(fd, table) == (ssize_t)ARRAY_SIZE_BYTES(table));
+	poor_zwp_linux_dmabuf_feedback_v1_send_format_table(feedback, fd, ARRAY_SIZE_BYTES(table));
 	if (poor_wl_resource_get_version(&feedback->resource) < 6) {
 		send_device(&array, swapchain_server.main_device);
 		poor_zwp_linux_dmabuf_feedback_v1_send_main_device(feedback, &array);
 	}
-	for (unsigned i = 0; i < swapchain_server.tranche_count; i++) {
-		const struct swapchain_server_tranche *tranche = &swapchain_server.tranches[i];
+	foreach_array_const_ref(arrview_first(swapchain_server.tranche_count, swapchain_server.tranches), tranche) {
+		auto indices = arrview_first(tranche->count, tranche->indices);
 
 		send_device(&array, tranche->device);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(feedback, &array);
 		array.size = 0;
-		memcpy(poor_wl_array_add(&array, tranche->count * ARRAY_ELEMENT_SIZE(tranche->indices)), tranche->indices,
-		       tranche->count * ARRAY_ELEMENT_SIZE(tranche->indices));
+		memcpy(poor_wl_array_add(&array, ARRAY_SIZE_BYTES(indices)), indices, ARRAY_SIZE_BYTES(indices));
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_formats(feedback, &array);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_flags(feedback, tranche->flags);
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
@@ -693,7 +695,7 @@ void swapchain_server_stop(void)
 
 void swapchain_server_release_held(void)
 {
-	for (unsigned i = 0; i < server.held_count; i++)
-		syncobj_signal(server.held[i].syncobj, server.held[i].point);
+	foreach_array_const_ref(arrview_first(server.held_count, server.held), held)
+		syncobj_signal(held->syncobj, held->point);
 	server.held_count = 0;
 }
