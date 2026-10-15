@@ -1,0 +1,6 @@
+[submodule "subprojects/poor_wayland"]
+	path = subprojects/poor_wayland
+	url = https://github.com/rustedsword/poor_wayland.git
+[submodule "subprojects/wayland-protocols"]
+	path = subprojects/wayland-protocols
+	url = https://gitlab.freedesktop.org/wayland/wayland-protocols.git

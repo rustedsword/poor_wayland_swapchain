@@ -1,0 +1,8 @@
+option('tests',
+  description: 'Compile the tests',
+  type: 'boolean',
+  value: true)
+option('examples',
+  description: 'Compile the examples',
+  type: 'boolean',
+  value: false)
