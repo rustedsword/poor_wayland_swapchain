@@ -250,6 +250,23 @@ static const struct poor_wl_buffer_listener buffer_listener = {
 };
 
 /* The tranches come in the order that the compositor prefers, the first one that the allocator manages is used */
+static const struct poor_wl_swapchain_tranche *allocate_format(struct poor_wl_swapchain *swapchain,
+							      struct poor_wl_swapchain_buffer *buffer, size_t format, int *ret)
+{
+	foreach_array_const_ref(arrview_first(swapchain->tranche_count, swapchain->tranches), tranche) {
+		if (!tranche->counts[format])
+			continue;
+		*ret = swapchain->allocator->allocate(swapchain->allocator_data, buffer, swapchain->formats[format],
+						      tranche->counts[format],
+						      arrview_first(tranche->counts[format], tranche->modifiers[format]),
+						      tranche->flags & POOR_ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT);
+		if (*ret >= 0)
+			return tranche;
+	}
+	return nullptr;
+}
+
+/* The formats come in the order that the caller prefers */
 static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer)
 {
 	const struct poor_wl_swapchain_tranche *tranche = nullptr;
@@ -257,16 +274,14 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 
 	buffer->width = swapchain->width;
 	buffer->height = swapchain->height;
-	foreach_array_const_ref(arrview_first(swapchain->tranche_count, swapchain->tranches), t) {
-		ret = swapchain->allocator->allocate(swapchain->allocator_data, buffer, swapchain->format, t->count,
-						     arrview_first(t->count, t->modifiers),
-						     t->flags & POOR_ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT);
-		if (ret >= 0) {
-			tranche = t;
+	foreach_array_index(arrview_first(swapchain->format_count, swapchain->formats), format) {
+		tranche = allocate_format(swapchain, buffer, format, &ret);
+		if (tranche) {
+			buffer->format = swapchain->formats[format];
 			break;
 		}
 	}
-	if (ret < 0)
+	if (!tranche)
 		return ret;
 	assert(buffer->plane_count && buffer->plane_count <= ARRAY_SIZE(buffer->planes));
 	auto planes = arrview_first(buffer->plane_count, buffer->planes);
@@ -293,7 +308,7 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 		plane->fd = -1;
 	}
 	poor_zwp_linux_buffer_params_v1_create_immed(&swapchain->params, &buffer->buffer, buffer->width, buffer->height,
-						     swapchain->format, 0);
+						     buffer->format, 0);
 	poor_zwp_linux_buffer_params_v1_destroy(&swapchain->params);
 	poor_wl_buffer_add_listener(&buffer->buffer, &buffer_listener, buffer);
 	buffer->allocated = true;
@@ -361,10 +376,16 @@ static const struct poor_wl_callback_listener frame_listener = {
 	.done = frame_done,
 };
 
-static bool tranches_equal(const struct poor_wl_swapchain_tranche *a, const struct poor_wl_swapchain_tranche *b)
+static bool tranches_equal(const struct poor_wl_swapchain *swapchain, const struct poor_wl_swapchain_tranche *a,
+			   const struct poor_wl_swapchain_tranche *b)
 {
-	return a->device == b->device && a->flags == b->flags && a->count == b->count &&
-	       !memcmp(a->modifiers, b->modifiers, ARRAY_SIZE_BYTES(arrview_first(a->count, a->modifiers)));
+	if (a->device != b->device || a->flags != b->flags)
+		return false;
+	foreach_array_index(arrview_first(swapchain->format_count, a->counts), i)
+		if (a->counts[i] != b->counts[i] ||
+		    memcmp(a->modifiers[i], b->modifiers[i], ARRAY_SIZE_BYTES(arrview_first(a->counts[i], a->modifiers[i]))))
+			return false;
+	return true;
 }
 
 static bool tranches_changed(const struct poor_wl_swapchain *swapchain)
@@ -372,7 +393,7 @@ static bool tranches_changed(const struct poor_wl_swapchain *swapchain)
 	if (swapchain->pending_count != swapchain->tranche_count)
 		return true;
 	foreach_array_index(arrview_first(swapchain->pending_count, swapchain->pending), i)
-		if (!tranches_equal(&swapchain->pending[i], &swapchain->tranches[i]))
+		if (!tranches_equal(swapchain, &swapchain->pending[i], &swapchain->tranches[i]))
 			return true;
 	return false;
 }
@@ -441,16 +462,29 @@ static void feedback_main_device(void *data, struct poor_zwp_linux_dmabuf_feedba
 	swapchain->has_main_device = true;
 }
 
-/* Tranches without the format of the swapchain are left out, as are the ones that don't fit */
+static void tranche_reset(struct poor_wl_swapchain *swapchain)
+{
+	swapchain->tranche.device = 0;
+	swapchain->tranche.flags = 0;
+	fill_array(arrview_first(swapchain->format_count, swapchain->tranche.counts), 0);
+}
+
+static bool tranche_has_formats(const struct poor_wl_swapchain *swapchain, const struct poor_wl_swapchain_tranche *tranche)
+{
+	foreach_array_const_ref(arrview_first(swapchain->format_count, tranche->counts), count)
+		if (*count)
+			return true;
+	return false;
+}
+
+/* Tranches without formats of the swapchain are left out, as are the ones that don't fit */
 static void feedback_tranche_done(void *data, struct poor_zwp_linux_dmabuf_feedback_v1 *)
 {
 	struct poor_wl_swapchain *swapchain = data;
 
-	if (swapchain->tranche.count && swapchain->pending_count < ARRAY_SIZE(swapchain->pending))
+	if (tranche_has_formats(swapchain, &swapchain->tranche) && swapchain->pending_count < ARRAY_SIZE(swapchain->pending))
 		swapchain->pending[swapchain->pending_count++] = swapchain->tranche;
-	swapchain->tranche.device = 0;
-	swapchain->tranche.flags = 0;
-	swapchain->tranche.count = 0;
+	tranche_reset(swapchain);
 }
 
 static void feedback_tranche_target_device(void *data, struct poor_zwp_linux_dmabuf_feedback_v1 *, struct poor_wl_array *device)
@@ -464,14 +498,22 @@ static void feedback_tranche_target_device(void *data, struct poor_zwp_linux_dma
 static void feedback_tranche_formats(void *data, struct poor_zwp_linux_dmabuf_feedback_v1 *, struct poor_wl_array *indices)
 {
 	struct poor_wl_swapchain *swapchain = data;
-	const struct format_modifier *table = swapchain->table;
-	size_t entries = swapchain->table_size / sizeof(*table);
+	auto table = array_ptr((const struct format_modifier *)swapchain->table,
+			       swapchain->table_size / sizeof(struct format_modifier));
 	struct poor_wl_swapchain_tranche *tranche = &swapchain->tranche;
 	const uint16_t *index;
 
-	poor_wl_array_for_each(index, indices)
-		if (*index < entries && table[*index].format == swapchain->format && tranche->count < ARRAY_SIZE(tranche->modifiers))
-			tranche->modifiers[tranche->count++] = table[*index].modifier;
+	poor_wl_array_for_each(index, indices) {
+		if (*index >= ARRAY_SIZE(table))
+			continue;
+		foreach_array_index(arrview_first(swapchain->format_count, swapchain->formats), i) {
+			if (swapchain->formats[i] != (*table)[*index].format)
+				continue;
+			if (tranche->counts[i] < ARRAY_SIZE(tranche->modifiers[i]))
+				tranche->modifiers[i][tranche->counts[i]++] = (*table)[*index].modifier;
+			break;
+		}
+	}
 }
 
 static void feedback_tranche_flags(void *data, struct poor_zwp_linux_dmabuf_feedback_v1 *, uint32_t flags)
@@ -489,12 +531,14 @@ static const struct poor_zwp_linux_dmabuf_feedback_v1_listener feedback_listener
 	.tranche_flags = feedback_tranche_flags,
 };
 
-POOR_WL_EXPORT void poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
-					   struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface,
-					   uint32_t format, poor_wl_swapchain_device_fn *device,
-					   poor_wl_swapchain_frame_fn *frame, poor_wl_swapchain_error_fn *error)
+POOR_WL_EXPORT void poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
+						struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface,
+						size_t count, const uint32_t (*formats)[count],
+						poor_wl_swapchain_device_fn *device, poor_wl_swapchain_frame_fn *frame,
+						poor_wl_swapchain_error_fn *error)
 {
 	assert(poor_zwp_linux_dmabuf_v1_get_version(dmabuf) >= POOR_ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK_SINCE_VERSION);
+	assert(count && count <= ARRAY_SIZE(swapchain->formats));
 	poor_loop_group_init(&swapchain->io);
 	poor_loop_op_init(&swapchain->release_op, swapchain_on_release);
 	poor_loop_timer_init(&swapchain->timer, swapchain_on_timer);
@@ -504,7 +548,8 @@ POOR_WL_EXPORT void poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, 
 	swapchain->syncobj_manager = nullptr;
 	swapchain->drm_fd = swapchain->eventfd = -1;
 	swapchain->surface = surface;
-	swapchain->format = format;
+	copy_array(swapchain->formats, formats);
+	swapchain->format_count = count;
 	swapchain->device_fn = device;
 	swapchain->frame_fn = frame;
 	swapchain->error_fn = error;
@@ -515,9 +560,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, 
 	swapchain->table_size = 0;
 	swapchain->presents = 0;
 	swapchain->tranche_count = swapchain->pending_count = 0;
-	swapchain->tranche.device = 0;
-	swapchain->tranche.flags = 0;
-	swapchain->tranche.count = 0;
+	tranche_reset(swapchain);
 	swapchain->main_device = swapchain->device = 0;
 	swapchain->time = 0;
 	swapchain->width = swapchain->height = 0;

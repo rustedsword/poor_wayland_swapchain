@@ -441,8 +441,8 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 	poor_xdg_toplevel_add_listener(&app->toplevel, &toplevel_listener, app);
 	poor_xdg_toplevel_set_title(&app->toplevel, "poor_wayland");
 	poor_xdg_toplevel_set_app_id(&app->toplevel, "poor_wayland.simple-egl");
-	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, GBM_FORMAT_XRGB8888, swapchain_device,
-			       swapchain_frame, swapchain_error);
+	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, ((const uint32_t[]){ GBM_FORMAT_XRGB8888 }),
+			       swapchain_device, swapchain_frame, swapchain_error);
 	app->swapchain_started = true;
 	poor_wl_surface_commit(&app->surface);
 }

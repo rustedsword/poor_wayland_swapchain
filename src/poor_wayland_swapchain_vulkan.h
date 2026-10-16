@@ -26,13 +26,13 @@ extern const char *const poor_wl_vulkan_device_extensions[POOR_WL_VULKAN_DEVICE_
 struct poor_wl_vulkan_image {
 	VkImage image;
 	VkDeviceMemory memory;
+	VkFormat format;
 };
 
 struct poor_wl_vulkan {
 	struct poor_loop *loop;
 	VkPhysicalDevice physical;
 	VkDevice device;
-	VkFormat format;
 	VkImageUsageFlags usage;
 	struct poor_wl_vulkan_image images[POOR_WL_SWAPCHAIN_BUFFERS];
 	PFN_vkGetPhysicalDeviceFormatProperties2 get_format_properties;
@@ -57,14 +57,19 @@ struct poor_wl_vulkan {
 VkPhysicalDevice
 poor_wl_vulkan_find_device(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, dev_t device, uint32_t *render_minor);
 
-/* Images of 'format' for 'usage' on 'device', which has poor_wl_vulkan_device_extensions and Vulkan 1.1 */
+/* Images for 'usage' on 'device', which has poor_wl_vulkan_device_extensions and Vulkan 1.1 */
 void
 poor_wl_vulkan_init(struct poor_wl_vulkan *vulkan, struct poor_loop *loop, PFN_vkGetInstanceProcAddr get_proc,
-		    VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkFormat format, VkImageUsageFlags usage);
+		    VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkImageUsageFlags usage);
+
+/* The Vulkan format of images of the DRM 'format', VK_FORMAT_UNDEFINED if there is none */
+VkFormat
+poor_wl_vulkan_format(uint32_t format);
 
 /*
  * Allocates images with one of the explicit modifiers that the device can share, 'data' is the struct
- * poor_wl_vulkan and buffers' 'data' a struct poor_wl_vulkan_image. Free them once their drawing is done.
+ * poor_wl_vulkan and buffers' 'data' a struct poor_wl_vulkan_image, which has the Vulkan format of the buffer. Free
+ * them once their drawing is done.
  */
 extern const struct poor_wl_swapchain_allocator poor_wl_vulkan_allocator;
 

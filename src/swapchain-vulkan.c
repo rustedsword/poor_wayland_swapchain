@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include <assert.h>
+#include <drm/drm_fourcc.h>
 #include <errno.h>
 #include <poor_loop_fd.h>
 #include <string.h>
@@ -75,15 +76,13 @@ POOR_WL_EXPORT VkPhysicalDevice poor_wl_vulkan_find_device(PFN_vkGetInstanceProc
 }
 
 POOR_WL_EXPORT void poor_wl_vulkan_init(struct poor_wl_vulkan *vulkan, struct poor_loop *loop, PFN_vkGetInstanceProcAddr get_proc,
-					VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkFormat format,
-					VkImageUsageFlags usage)
+					VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkImageUsageFlags usage)
 {
 	PFN_vkGetDeviceProcAddr get_device_proc = (PFN_vkGetDeviceProcAddr)get_proc(instance, "vkGetDeviceProcAddr");
 
 	vulkan->loop = loop;
 	vulkan->physical = physical;
 	vulkan->device = device;
-	vulkan->format = format;
 	vulkan->usage = usage;
 	vulkan->get_format_properties =
 		(PFN_vkGetPhysicalDeviceFormatProperties2)get_proc(instance, "vkGetPhysicalDeviceFormatProperties2");
@@ -105,7 +104,41 @@ POOR_WL_EXPORT void poor_wl_vulkan_init(struct poor_wl_vulkan *vulkan, struct po
 	assert(vulkan->get_memory_fd && vulkan->get_image_modifier);
 }
 
-static bool exportable(struct poor_wl_vulkan *vulkan, uint64_t modifier, const struct poor_wl_swapchain_buffer *buffer)
+/*
+ * DRM formats are little endian: the bytes of XRGB8888 are blue, green, red and the unused one. Packed Vulkan formats
+ * are in the order of the host, so they only match on little endian hosts.
+ */
+static const struct {
+	uint32_t drm;
+	VkFormat vulkan;
+} formats[] = {
+	{ DRM_FORMAT_XRGB8888, VK_FORMAT_B8G8R8A8_UNORM },
+	{ DRM_FORMAT_ARGB8888, VK_FORMAT_B8G8R8A8_UNORM },
+	{ DRM_FORMAT_XBGR8888, VK_FORMAT_R8G8B8A8_UNORM },
+	{ DRM_FORMAT_ABGR8888, VK_FORMAT_R8G8B8A8_UNORM },
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	{ DRM_FORMAT_XRGB2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
+	{ DRM_FORMAT_ARGB2101010, VK_FORMAT_A2R10G10B10_UNORM_PACK32 },
+	{ DRM_FORMAT_XBGR2101010, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
+	{ DRM_FORMAT_ABGR2101010, VK_FORMAT_A2B10G10R10_UNORM_PACK32 },
+	{ DRM_FORMAT_RGB565, VK_FORMAT_R5G6B5_UNORM_PACK16 },
+	{ DRM_FORMAT_XBGR16161616, VK_FORMAT_R16G16B16A16_UNORM },
+	{ DRM_FORMAT_ABGR16161616, VK_FORMAT_R16G16B16A16_UNORM },
+	{ DRM_FORMAT_XBGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT },
+	{ DRM_FORMAT_ABGR16161616F, VK_FORMAT_R16G16B16A16_SFLOAT },
+#endif
+};
+
+POOR_WL_EXPORT VkFormat poor_wl_vulkan_format(uint32_t format)
+{
+	foreach_array_const_ref(formats, pair)
+		if (pair->drm == format)
+			return pair->vulkan;
+	return VK_FORMAT_UNDEFINED;
+}
+
+static bool exportable(struct poor_wl_vulkan *vulkan, VkFormat format, uint64_t modifier,
+		       const struct poor_wl_swapchain_buffer *buffer)
 {
 	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
@@ -120,7 +153,7 @@ static bool exportable(struct poor_wl_vulkan *vulkan, uint64_t modifier, const s
 	VkPhysicalDeviceImageFormatInfo2 info = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
 		.pNext = &external_info,
-		.format = vulkan->format,
+		.format = format,
 		.type = VK_IMAGE_TYPE_2D,
 		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
 		.usage = vulkan->usage,
@@ -145,8 +178,9 @@ static VkFormatFeatureFlags usage_features(VkImageUsageFlags usage)
 }
 
 /* The modifiers of the tranche that the driver has for the usage and shares, with their numbers of memory planes */
-static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poor_wl_swapchain_buffer *buffer, unsigned count,
-				 const uint64_t (*modifiers)[count], uint64_t (*usable)[count], uint32_t (*planes)[count])
+static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poor_wl_swapchain_buffer *buffer, VkFormat format,
+				 unsigned count, const uint64_t (*modifiers)[count], uint64_t (*usable)[count],
+				 uint32_t (*planes)[count])
 {
 	VkDrmFormatModifierPropertiesEXT driver[DRIVER_MODIFIERS];
 	VkDrmFormatModifierPropertiesListEXT list = {
@@ -158,13 +192,13 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 	VkFormatFeatureFlags features = usage_features(vulkan->usage);
 	unsigned n = 0;
 
-	vulkan->get_format_properties(vulkan->physical, vulkan->format, &properties);
+	vulkan->get_format_properties(vulkan->physical, format, &properties);
 	foreach_array_const_ref(modifiers, modifier) {
 		foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
 			if (listed->drmFormatModifier != *modifier ||
 			    (listed->drmFormatModifierTilingFeatures & features) != features ||
 			    listed->drmFormatModifierPlaneCount > ARRAY_SIZE(buffer->planes) ||
-			    !exportable(vulkan, *modifier, buffer))
+			    !exportable(vulkan, format, *modifier, buffer))
 				continue;
 			(*usable)[n] = *modifier;
 			(*planes)[n++] = listed->drmFormatModifierPlaneCount;
@@ -254,17 +288,21 @@ static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulka
 }
 
 /* Vulkan picks one of the modifiers, each memory plane of the image becomes a plane of the buffer */
-static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t, unsigned count,
+static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
 			   const uint64_t (*modifiers)[count], bool)
 {
 	struct poor_wl_vulkan *vulkan = data;
 	struct poor_wl_vulkan_image *image = &vulkan->images[array_ref_index(buffer->swapchain->buffers, buffer)];
+	VkFormat vulkan_format = poor_wl_vulkan_format(format);
 	uint64_t usable[POOR_WL_SWAPCHAIN_MODIFIERS];
 	uint32_t planes[POOR_WL_SWAPCHAIN_MODIFIERS];
 	unsigned n;
 
 	assert(count <= ARRAY_SIZE(usable));
-	n = usable_modifiers(vulkan, buffer, count, modifiers, arrview_first(count, usable), arrview_first(count, planes));
+	if (vulkan_format == VK_FORMAT_UNDEFINED)
+		return -ENOTSUP;
+	n = usable_modifiers(vulkan, buffer, vulkan_format, count, modifiers, arrview_first(count, usable),
+			     arrview_first(count, planes));
 	VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
 		.drmFormatModifierCount = n,
@@ -279,7 +317,7 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.pNext = &external,
 		.imageType = VK_IMAGE_TYPE_2D,
-		.format = vulkan->format,
+		.format = vulkan_format,
 		.extent = { (uint32_t)buffer->width, (uint32_t)buffer->height, 1 },
 		.mipLevels = 1,
 		.arrayLayers = 1,
@@ -303,6 +341,7 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 			continue;
 		if (image_export(vulkan, image, buffer, planes[i]) != VK_SUCCESS)
 			break;
+		image->format = vulkan_format;
 		buffer->modifier = chosen.drmFormatModifier;
 		buffer->data = image;
 		return 0;

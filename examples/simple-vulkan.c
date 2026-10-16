@@ -26,18 +26,19 @@
 
 /*
  * A square that goes through all hues and bounces over a still background, cleared with Vulkan on the GPU that the
- * compositor names in its dmabuf feedback and presented through the swapchain. A frame damages only where the square
- * was and is, and a buffer redraws only what changed since the frame that it holds, which its age tells. Vulkan has no
- * implicit synchronization, so the compositor needs explicit synchronization. It runs until its close button is
- * pressed or until SIGINT or SIGTERM. WAYLAND_DEBUG=client shows the protocol.
+ * compositor names in its dmabuf feedback and presented through the swapchain, with 10 bits per channel if the
+ * compositor and the GPU have them. A frame damages only where the square was and is, and a buffer redraws only what
+ * changed since the frame that it holds, which its age tells. Vulkan has no implicit synchronization, so the
+ * compositor needs explicit synchronization. It runs until its close button is pressed or until SIGINT or SIGTERM.
+ * WAYLAND_DEBUG=client shows the protocol.
  */
 constexpr int32_t DEFAULT_WIDTH = 640;
 constexpr int32_t DEFAULT_HEIGHT = 480;
 constexpr int32_t SQUARE = 96;
 constexpr unsigned HISTORY = 4;
 constexpr uint64_t DRAIN_TIMEOUT_NS = 1'000'000'000;
-constexpr VkFormat FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 
+static const uint32_t formats[] = { DRM_FORMAT_XRGB2101010, DRM_FORMAT_XRGB8888 };
 static const VkClearColorValue background = { .float32 = { 0.1f, 0.1f, 0.12f, 1.0f } };
 
 poor_loop_fd_declare(signal_file);
@@ -88,6 +89,7 @@ struct app {
 	sigset_t sigset;
 	int status;
 	int32_t width, height, presented_width, presented_height;
+	uint32_t format;
 	bool have_compositor, have_dmabuf, have_syncobj, have_wm_base;
 	bool swapchain_started, swapchain_closed, closing, signals_closed;
 	char path[32];
@@ -214,13 +216,13 @@ static void target_fini(struct app *app, struct target *target)
 	vkDestroyImageView(app->device, target->view, nullptr);
 }
 
-static bool target_init(struct app *app, struct target *target, VkImage image)
+static bool target_init(struct app *app, struct target *target, const struct poor_wl_vulkan_image *image)
 {
 	VkImageViewCreateInfo view_info = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.image = image,
+		.image = image->image,
 		.viewType = VK_IMAGE_VIEW_TYPE_2D,
-		.format = FORMAT,
+		.format = image->format,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
 	VkCommandBufferAllocateInfo commands_info = {
@@ -249,13 +251,17 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 
 	if (ret < 0)
 		return ret;
-	if (!target_init(app, target, ((struct poor_wl_vulkan_image *)buffer->data)->image)) {
+	if (!target_init(app, target, buffer->data)) {
 		target_fini(app, target);
 		foreach_array_const_ref(arrview_first(buffer->plane_count, buffer->planes), plane)
 			poor_loop_close_fd_or_submit(&app->loop, plane->fd, 0);
 		poor_wl_vulkan_allocator.free(&app->vulkan, buffer);
 		return -ENOMEM;
 	}
+	if (format != app->format)
+		log_printf("simple-vulkan: buffers in %c%c%c%c\n", (char)format, (char)(format >> 8), (char)(format >> 16),
+			   (char)(format >> 24));
+	app->format = format;
 	return 0;
 }
 
@@ -360,7 +366,7 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		return false;
 	vkGetDeviceQueue(app->device, app->family, 0, &app->queue);
 	app->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(app->device, "vkGetSemaphoreFdKHR");
-	poor_wl_vulkan_init(&app->vulkan, &app->loop, vkGetInstanceProcAddr, app->instance, app->physical, app->device, FORMAT,
+	poor_wl_vulkan_init(&app->vulkan, &app->loop, vkGetInstanceProcAddr, app->instance, app->physical, app->device,
 			    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 	return check(vkCreateCommandPool(app->device, &pool_info, nullptr, &app->pool), "vkCreateCommandPool") &&
 	       check(vkCreateSemaphore(app->device, &semaphore_info, nullptr, &app->rendered), "vkCreateSemaphore");
@@ -677,7 +683,7 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 	poor_xdg_toplevel_add_listener(&app->toplevel, &toplevel_listener, app);
 	poor_xdg_toplevel_set_title(&app->toplevel, "poor_wayland");
 	poor_xdg_toplevel_set_app_id(&app->toplevel, "poor_wayland.simple-vulkan");
-	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, DRM_FORMAT_XRGB8888, swapchain_device,
+	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, formats, swapchain_device,
 			       swapchain_frame, swapchain_error);
 	app->swapchain_started = true;
 	poor_wl_surface_commit(&app->surface);
@@ -746,6 +752,7 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->width = DEFAULT_WIDTH;
 	app->height = DEFAULT_HEIGHT;
 	app->presented_width = app->presented_height = 0;
+	app->format = 0;
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
 		log_printf("simple-vulkan: can't connect: %s\n", strerror(errno));
 		return -1;

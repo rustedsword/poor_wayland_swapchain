@@ -14,7 +14,8 @@
 #include "test-loop.h"
 #include "test-runner.h"
 
-constexpr VkFormat FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
+
+static const uint32_t formats[] = { DRM_FORMAT_XRGB2101010, DRM_FORMAT_XRGB8888 };
 
 /* How the image of a buffer is drawn */
 struct target {
@@ -44,6 +45,7 @@ struct client {
 	PFN_vkGetSemaphoreFdKHR get_semaphore_fd;
 	uint32_t family;
 	unsigned frames, max_frames, allocations, frees, partial_frames;
+	bool ten_bit;
 	bool synced, done, error_called, swapchain_done;
 	char in[16384];
 	char out[16384];
@@ -126,7 +128,7 @@ static bool vulkan_start(struct client *c, dev_t device)
 	c->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(c->device, "vkGetSemaphoreFdKHR");
 	assert(vkCreateCommandPool(c->device, &pool_info, nullptr, &c->pool) == VK_SUCCESS);
 	assert(vkCreateSemaphore(c->device, &semaphore_info, nullptr, &c->rendered) == VK_SUCCESS);
-	poor_wl_vulkan_init(&c->vulkan, c->loop, vkGetInstanceProcAddr, c->instance, c->physical, c->device, FORMAT,
+	poor_wl_vulkan_init(&c->vulkan, c->loop, vkGetInstanceProcAddr, c->instance, c->physical, c->device,
 			    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 	return true;
 }
@@ -139,8 +141,8 @@ static void vulkan_stop(struct client *c)
 	vkDestroyInstance(c->instance, nullptr);
 }
 
-/* The feedback has the modifiers that the driver draws into, then linear */
-static void server_config(struct client *c, dev_t device, int syncobj_fd)
+/* Up to half of the format table gets the modifiers that the driver draws 'format' into, then linear */
+static unsigned add_format(struct client *c, uint32_t format, unsigned n)
 {
 	VkDrmFormatModifierPropertiesEXT driver[64];
 	VkDrmFormatModifierPropertiesListEXT list = {
@@ -149,22 +151,32 @@ static void server_config(struct client *c, dev_t device, int syncobj_fd)
 		.pDrmFormatModifierProperties = driver,
 	};
 	VkFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list };
-	unsigned n = 0;
+	unsigned end = n + ARRAY_SIZE(swapchain_server.table) / 2 - 1;
 
-	vkGetPhysicalDeviceFormatProperties2(c->physical, FORMAT, &properties);
+	vkGetPhysicalDeviceFormatProperties2(c->physical, poor_wl_vulkan_format(format), &properties);
 	foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
-		if (n == ARRAY_SIZE(swapchain_server.table) - 1)
-			break;
-		if (listed->drmFormatModifier == DRM_FORMAT_MOD_LINEAR ||
-		    !(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+		if (!(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
 			continue;
-		swapchain_server.table[n].format = DRM_FORMAT_XRGB8888;
+		c->ten_bit |= format == DRM_FORMAT_XRGB2101010;
+		if (n == end || listed->drmFormatModifier == DRM_FORMAT_MOD_LINEAR)
+			continue;
+		swapchain_server.table[n].format = format;
 		swapchain_server.table[n].padding = 0;
 		swapchain_server.table[n++].modifier = listed->drmFormatModifier;
 	}
-	swapchain_server.table[n].format = DRM_FORMAT_XRGB8888;
+	swapchain_server.table[n].format = format;
 	swapchain_server.table[n].padding = 0;
 	swapchain_server.table[n++].modifier = DRM_FORMAT_MOD_LINEAR;
+	return n;
+}
+
+/* The feedback has the 10 and the 8 bit formats that the driver draws into */
+static void server_config(struct client *c, dev_t device, int syncobj_fd)
+{
+	unsigned n;
+
+	c->ten_bit = false;
+	n = add_format(c, DRM_FORMAT_XRGB8888, add_format(c, DRM_FORMAT_XRGB2101010, 0));
 	swapchain_server.dmabuf_version = 4;
 	swapchain_server.main_device = device;
 	swapchain_server.entries = n;
@@ -190,7 +202,6 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 	VkImageViewCreateInfo view_info = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.viewType = VK_IMAGE_VIEW_TYPE_2D,
-		.format = FORMAT,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
 	VkCommandBufferAllocateInfo commands_info = {
@@ -205,6 +216,7 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 	if (ret < 0)
 		return ret;
 	view_info.image = ((struct poor_wl_vulkan_image *)buffer->data)->image;
+	view_info.format = ((struct poor_wl_vulkan_image *)buffer->data)->format;
 	assert(vkCreateImageView(c->device, &view_info, nullptr, &target->view) == VK_SUCCESS);
 	assert(vkAllocateCommandBuffers(c->device, &commands_info, &target->commands) == VK_SUCCESS);
 	assert(vkCreateFence(c->device, &fence_info, nullptr, &target->done) == VK_SUCCESS);
@@ -400,7 +412,7 @@ static void client_start(struct client *c, int syncobj_fd)
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
 	client_roundtrip(c);
 	poor_wl_compositor_create_surface(&c->compositor, &c->surface);
-	poor_wl_swapchain_init(&c->swapchain, c->loop, &c->dmabuf, &c->surface, DRM_FORMAT_XRGB8888, swapchain_device,
+	poor_wl_swapchain_init(&c->swapchain, c->loop, &c->dmabuf, &c->surface, formats, swapchain_device,
 			       swapchain_frame, swapchain_error);
 	assert(!poor_wl_swapchain_set_syncobj(&c->swapchain, &c->syncobj, syncobj_fd));
 	poor_wl_swapchain_set_allocator(&c->swapchain, &allocator, c);
@@ -461,6 +473,7 @@ TEST(vulkan_frames)
 	client_present(&c, 64, 32, 10);
 	client_present(&c, 96, 64, 10);
 	assert(swapchain_server.acquires == 20 && swapchain_server.planes >= 1 && c.allocations >= 2 && c.partial_frames);
+	assert(swapchain_server.format == (c.ten_bit ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888));
 	client_stop(&c);
 	swapchain_server_stop();
 	run_until(&loop, swapchain_server.display_done);

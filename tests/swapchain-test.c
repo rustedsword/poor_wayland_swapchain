@@ -35,6 +35,7 @@ struct client {
 	dev_t device;
 	unsigned devices, frames, max_frames, allocations, frees;
 	uint64_t ages[32];
+	uint32_t format, fail_format;
 	int swapchain_error, fence_fd;
 	bool synced, done, error_called, fail_scanout, have_syncobj, swapchain_done, partial;
 	char in[16384];
@@ -75,13 +76,13 @@ static struct client *client_of(struct poor_wl_swapchain *swapchain)
 	return container_of(swapchain, struct client, swapchain);
 }
 
-static int memfd_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t, unsigned count,
+static int memfd_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_t format, unsigned count,
 			  const uint64_t (*modifiers)[count], bool scanout)
 {
 	struct client *c = data;
 	int fd;
 
-	if (scanout && c->fail_scanout)
+	if ((scanout && c->fail_scanout) || format == c->fail_format)
 		return -ENOTSUP;
 	assert(count);
 	fd = memfd_create("swapchain-test", MFD_CLOEXEC);
@@ -130,6 +131,10 @@ static int signaled_fence(int drm_fd)
 	return export.fd;
 }
 
+static const uint32_t xrgb8888[] = { DRM_FORMAT_XRGB8888 };
+static const uint32_t rgb565[] = { DRM_FORMAT_RGB565 };
+static const uint32_t argb_or_xrgb[] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
+
 static const struct poor_wl_swapchain_rect partial_damage[] = { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } };
 
 static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t)
@@ -139,6 +144,7 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 
 	assert(buffer->width == swapchain->width && buffer->height == swapchain->height && c->frames < ARRAY_SIZE(c->ages));
 	c->ages[c->frames++] = buffer->age;
+	c->format = buffer->format;
 	if (c->partial)
 		poor_wl_swapchain_present_damage(swapchain, buffer, fence, partial_damage);
 	else
@@ -209,13 +215,14 @@ static void client_done(struct poor_wl_display *display)
 }
 
 /* The feedback comes with the roundtrip after the swapchain asked for it */
-static void client_start(struct client *c, struct poor_loop *loop, uint32_t format)
+static void client_start_impl(struct client *c, struct poor_loop *loop, size_t count, const uint32_t (*formats)[count])
 {
 	struct poor_wl_connection_memory memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);
 
 	c->loop = loop;
 	c->devices = c->frames = c->max_frames = c->allocations = c->frees = 0;
 	c->swapchain_error = 0;
+	c->fail_format = 0;
 	c->fence_fd = -1;
 	c->synced = c->done = c->error_called = c->fail_scanout = c->have_syncobj = c->swapchain_done = c->partial = false;
 	poor_wl_display_connect_to_fd(&c->display, loop, &memory, swapchain_server_connect(), client_error, client_done);
@@ -223,10 +230,12 @@ static void client_start(struct client *c, struct poor_loop *loop, uint32_t form
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
 	client_roundtrip(c);
 	poor_wl_compositor_create_surface(&c->compositor, &c->surface);
-	poor_wl_swapchain_init(&c->swapchain, loop, &c->dmabuf, &c->surface, format, swapchain_device, swapchain_frame,
+	poor_wl_swapchain_init(&c->swapchain, loop, &c->dmabuf, &c->surface, formats, swapchain_device, swapchain_frame,
 			       swapchain_error);
 	client_roundtrip(c);
 }
+
+#define client_start(c, loop, formats) client_start_impl(c, loop, ARRAY_SIZE(formats), &auto_arr(formats))
 
 static void client_stop(struct client *c)
 {
@@ -259,12 +268,12 @@ TEST(feedback_picks_device_and_modifiers)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(c.devices == 1 && c.device == makedev(226, 0) && c.swapchain.tranche_count == 2);
 	tranches = c.swapchain.tranches;
-	assert(tranches[0].flags == SCANOUT && tranches[0].count == 1 && tranches[0].modifiers[0] == I915_FORMAT_MOD_X_TILED);
-	assert(tranches[1].count == 2 && tranches[1].modifiers[0] == DRM_FORMAT_MOD_LINEAR);
-	assert(tranches[1].modifiers[1] == DRM_FORMAT_MOD_INVALID);
+	assert(tranches[0].flags == SCANOUT && tranches[0].counts[0] == 1 && tranches[0].modifiers[0][0] == I915_FORMAT_MOD_X_TILED);
+	assert(tranches[1].counts[0] == 2 && tranches[1].modifiers[0][0] == DRM_FORMAT_MOD_LINEAR);
+	assert(tranches[1].modifiers[0][1] == DRM_FORMAT_MOD_INVALID);
 	client_stop(&c);
 	server_stop(&loop);
 	loop_fini(&loop);
@@ -279,7 +288,7 @@ TEST(frames_are_presented)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 64, 32, 10);
 	assert(swapchain_server.format == DRM_FORMAT_XRGB8888 && swapchain_server.modifier == I915_FORMAT_MOD_X_TILED);
@@ -298,7 +307,7 @@ TEST(damage_reaches_compositor)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 16, 16, 1);
 	assert(swapchain_server.damage_count == 1 && !swapchain_server.damage[0].x && !swapchain_server.damage[0].y &&
@@ -327,11 +336,73 @@ TEST(buffers_know_their_age)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 16, 16, 4);
 	client_present(&c, 32, 16, 3);
 	assert(c.frames == ARRAY_SIZE(ages) && !memcmp(c.ages, ages, ARRAY_SIZE_BYTES(ages)));
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+/* Only the second tranche has ARGB8888, which goes before XRGB8888 of the first one */
+TEST(first_offered_format_wins)
+{
+	static const uint32_t formats[] = { DRM_FORMAT_RGB565, DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, formats);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 2);
+	assert(c.format == DRM_FORMAT_ARGB8888 && swapchain_server.format == DRM_FORMAT_ARGB8888);
+	assert(swapchain_server.modifier == DRM_FORMAT_MOD_LINEAR);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(allocation_falls_back_to_next_format)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, argb_or_xrgb);
+	c.fail_format = DRM_FORMAT_ARGB8888;
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 2);
+	assert(c.format == DRM_FORMAT_XRGB8888 && swapchain_server.modifier == I915_FORMAT_MOD_X_TILED);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(feedback_change_switches_format)
+{
+	struct poor_loop loop;
+	unsigned allocations;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, argb_or_xrgb);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 2);
+	assert(c.format == DRM_FORMAT_ARGB8888);
+	allocations = c.allocations;
+	swapchain_server.tranches[1] = (struct swapchain_server_tranche){ makedev(226, 128), 0, 2, { 0, 3 } };
+	swapchain_server_send_feedback();
+	client_roundtrip(&c);
+	client_present(&c, 16, 16, 2);
+	assert(c.format == DRM_FORMAT_XRGB8888 && swapchain_server.format == DRM_FORMAT_XRGB8888 && c.frees == allocations);
 	client_stop(&c);
 	server_stop(&loop);
 	loop_fini(&loop);
@@ -345,7 +416,7 @@ TEST(allocation_falls_back_to_next_tranche)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	c.fail_scanout = true;
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 16, 16, 3);
@@ -365,7 +436,7 @@ TEST(resize_replaces_buffers)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 64, 32, 5);
 	allocations = c.allocations;
@@ -385,14 +456,14 @@ TEST(feedback_change_replaces_buffers)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 64, 32, 3);
 	allocations = c.allocations;
 	swapchain_server.tranches[0].indices[0] = 0;
 	swapchain_server_send_feedback();
 	client_roundtrip(&c);
-	assert(c.devices == 1 && c.swapchain.tranches[0].modifiers[0] == DRM_FORMAT_MOD_LINEAR);
+	assert(c.devices == 1 && c.swapchain.tranches[0].modifiers[0][0] == DRM_FORMAT_MOD_LINEAR);
 	client_present(&c, 64, 32, 3);
 	assert(swapchain_server.modifier == DRM_FORMAT_MOD_LINEAR && c.frees == allocations);
 	client_stop(&c);
@@ -408,7 +479,7 @@ TEST(device_of_sampling_tranche_without_main_device)
 	loop_init(&loop);
 	server_config(6);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(c.devices == 1 && c.device == makedev(226, 128));
 	client_stop(&c);
 	server_stop(&loop);
@@ -424,7 +495,7 @@ TEST(sampling_tranche_sets_sampling_device)
 	loop_init(&loop);
 	server_config(6);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 16, 16, 3);
 	assert(swapchain_server.modifier == I915_FORMAT_MOD_X_TILED && !swapchain_server.sampling_device);
@@ -444,7 +515,7 @@ TEST(format_without_tranche)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_RGB565);
+	client_start(&c, &loop, rgb565);
 	assert(c.swapchain_error == ENOTSUP && !c.devices);
 	client_stop(&c);
 	server_stop(&loop);
@@ -467,7 +538,7 @@ TEST(explicit_sync)
 	server_config(4);
 	swapchain_server.syncobj_fd = fd;
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(c.have_syncobj && !poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd));
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 64, 32, 10);
@@ -499,7 +570,7 @@ TEST(explicit_sync_waits_for_releases)
 	swapchain_server.syncobj_fd = fd;
 	swapchain_server.hold_releases = true;
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(!poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd));
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	c.max_frames = 10;
@@ -535,7 +606,7 @@ TEST(explicit_sync_frees_replaced_buffers)
 	swapchain_server.syncobj_fd = fd;
 	swapchain_server.hold_releases = true;
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(!poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd));
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
 	client_present(&c, 64, 32, 2);
@@ -559,7 +630,7 @@ TEST(explicit_sync_needs_drm_device)
 	loop_init(&loop);
 	server_config(4);
 	swapchain_server_start(&loop);
-	client_start(&c, &loop, DRM_FORMAT_XRGB8888);
+	client_start(&c, &loop, xrgb8888);
 	assert(c.have_syncobj && poor_wl_swapchain_set_syncobj(&c.swapchain, &c.syncobj, fd) == -ENOTTY);
 	poor_loop_close_fd_or_submit(&loop, fd, 0);
 	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);

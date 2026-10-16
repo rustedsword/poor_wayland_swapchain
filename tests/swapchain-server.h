@@ -20,7 +20,7 @@ struct swapchain_server_tranche {
 	dev_t device;
 	uint32_t flags;
 	unsigned count;
-	uint16_t indices[8];
+	uint16_t indices[16];
 };
 
 struct swapchain_server_state {
@@ -31,7 +31,7 @@ struct swapchain_server_state {
 		uint32_t format;
 		uint32_t padding;
 		uint64_t modifier;
-	} table[8];
+	} table[16];
 	unsigned tranche_count;
 	struct swapchain_server_tranche tranches[4];
 	unsigned buffers_created, buffers_destroyed, commits, feedbacks, clients_done;

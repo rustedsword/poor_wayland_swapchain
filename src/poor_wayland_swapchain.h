@@ -24,6 +24,7 @@ extern "C" {
  */
 
 constexpr unsigned POOR_WL_SWAPCHAIN_BUFFERS = 3;
+constexpr unsigned POOR_WL_SWAPCHAIN_FORMATS = 4;
 constexpr unsigned POOR_WL_SWAPCHAIN_TRANCHES = 4;
 constexpr unsigned POOR_WL_SWAPCHAIN_MODIFIERS = 64;
 constexpr unsigned POOR_WL_SWAPCHAIN_PLANES = 4;
@@ -44,9 +45,9 @@ struct poor_wl_swapchain_rect {
 };
 
 /*
- * The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes.
- * 'age' is set before the frame function: the buffer holds the frame presented 'age' frames ago, 1 being the last one,
- * or undefined contents if it is 0.
+ * The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes and
+ * sets 'format', the one of its formats that the buffer was allocated in. 'age' is set before the frame function: the
+ * buffer holds the frame presented 'age' frames ago, 1 being the last one, or undefined contents if it is 0.
  */
 struct poor_wl_swapchain_buffer {
 	struct poor_wl_buffer buffer;
@@ -60,7 +61,7 @@ struct poor_wl_swapchain_buffer {
 	uint64_t age, presented;
 	struct poor_wl_swapchain_plane planes[POOR_WL_SWAPCHAIN_PLANES];
 	unsigned plane_count;
-	uint32_t syncobj;
+	uint32_t format, syncobj;
 	int32_t width, height;
 	bool allocated, busy, stale, waiting;
 };
@@ -76,12 +77,12 @@ struct poor_wl_swapchain_allocator {
 	void (*free)(void *data, struct poor_wl_swapchain_buffer *buffer);
 };
 
-/* The modifiers of the format of the swapchain in a tranche of the feedback */
+/* The modifiers of each format of the swapchain in a tranche of the feedback */
 struct poor_wl_swapchain_tranche {
 	dev_t device;
 	uint32_t flags;
-	unsigned count;
-	uint64_t modifiers[POOR_WL_SWAPCHAIN_MODIFIERS];
+	unsigned counts[POOR_WL_SWAPCHAIN_FORMATS];
+	uint64_t modifiers[POOR_WL_SWAPCHAIN_FORMATS][POOR_WL_SWAPCHAIN_MODIFIERS];
 };
 
 /* The buffers have to come from 'device', which is set again if it changes */
@@ -112,7 +113,7 @@ struct poor_wl_swapchain {
 	struct poor_wl_swapchain_tranche tranches[POOR_WL_SWAPCHAIN_TRANCHES];
 	struct poor_wl_swapchain_tranche pending[POOR_WL_SWAPCHAIN_TRANCHES];
 	struct poor_wl_swapchain_tranche tranche;
-	unsigned tranche_count, pending_count;
+	unsigned tranche_count, pending_count, format_count;
 	const struct poor_wl_swapchain_allocator *allocator;
 	void *allocator_data;
 	poor_wl_swapchain_device_fn *device_fn;
@@ -123,21 +124,27 @@ struct poor_wl_swapchain {
 	size_t table_size;
 	uint64_t released, presents;
 	dev_t main_device, device;
-	uint32_t format, time;
+	uint32_t formats[POOR_WL_SWAPCHAIN_FORMATS];
+	uint32_t time;
 	int drm_fd, eventfd;
 	int32_t width, height;
 	bool has_main_device, has_device, frame_pending, frame_wanted, failed;
 };
 
 /*
- * Present buffers of 'format' on 'surface'. 'dmabuf' has at least version 4. 'device' tells where to allocate,
- * buffers come once poor_wl_swapchain_set_allocator() was called.
+ * Present buffers on 'surface' in the first of 'formats' that the compositor takes and the allocator manages.
+ * 'formats' is an array of up to POOR_WL_SWAPCHAIN_FORMATS DRM formats in order of preference, or a pointer to one.
+ * 'dmabuf' has at least version 4. 'device' tells where to allocate, buffers come once
+ * poor_wl_swapchain_set_allocator() was called.
  */
 void
-poor_wl_swapchain_init(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
-		       struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface, uint32_t format,
-		       poor_wl_swapchain_device_fn *device, poor_wl_swapchain_frame_fn *frame,
-		       poor_wl_swapchain_error_fn *error);
+poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
+			    struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface, size_t count,
+			    const uint32_t (*formats)[count], poor_wl_swapchain_device_fn *device,
+			    poor_wl_swapchain_frame_fn *frame, poor_wl_swapchain_error_fn *error);
+#define poor_wl_swapchain_init(swapchain, loop, dmabuf, surface, formats, device, frame, error) \
+	poor_wl_swapchain_init_impl(swapchain, loop, dmabuf, surface, ARRAY_SIZE(formats), &auto_arr(formats), device, \
+				    frame, error)
 
 /*
  * Synchronize explicitly through 'manager': the compositor waits for the fences of poor_wl_swapchain_present(), and
