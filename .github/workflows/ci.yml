@@ -20,7 +20,7 @@ jobs:
         build: [sanitizers, release]
         deps: [system, bundled]
     env:
-      MESON_ARGS: -Dwerror=true -Dexamples=true ${{ matrix.build == 'sanitizers' && '-Dbuildtype=debug -Db_sanitize=address,undefined' || '-Dbuildtype=release' }} ${{ matrix.deps == 'system' && '--wrap-mode=nofallback' || '--force-fallback-for=poor_wayland,wayland-protocols,poor_loop,liburing,poor_base' }}
+      MESON_ARGS: -Dwerror=true -Dexamples=true ${{ matrix.build == 'sanitizers' && '-Dbuildtype=debug -Db_sanitize=address,undefined' || '-Dbuildtype=release' }} ${{ matrix.deps == 'system' && '--wrap-mode=nofallback' || '--force-fallback-for=poor_wayland,wayland-protocols,poor_loop,liburing,poor_base -Ddefault_library=static' }}
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies
@@ -66,7 +66,7 @@ jobs:
         deps: [system, bundled]
     env:
       CC: clang-${{ matrix.version }}
-      MESON_ARGS: -Dwerror=true -Dexamples=true ${{ matrix.build == 'sanitizers' && '-Dbuildtype=debug -Db_sanitize=address,undefined -Db_lundef=false' || '-Dbuildtype=release' }} ${{ matrix.deps == 'system' && '--wrap-mode=nofallback' || '--force-fallback-for=poor_wayland,wayland-protocols,poor_loop,liburing,poor_base' }}
+      MESON_ARGS: -Dwerror=true -Dexamples=true ${{ matrix.build == 'sanitizers' && '-Dbuildtype=debug -Db_sanitize=address,undefined -Db_lundef=false' || '-Dbuildtype=release' }} ${{ matrix.deps == 'system' && '--wrap-mode=nofallback' || '--force-fallback-for=poor_wayland,wayland-protocols,poor_loop,liburing,poor_base -Ddefault_library=static' }}
     steps:
       - uses: actions/checkout@v5
       - name: Install dependencies
