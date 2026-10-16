@@ -37,27 +37,27 @@ struct poor_wl_vulkan {
 	struct poor_wl_vulkan_image images[POOR_WL_SWAPCHAIN_BUFFERS];
 	PFN_vkGetPhysicalDeviceFormatProperties2 get_format_properties;
 	PFN_vkGetPhysicalDeviceImageFormatProperties2 get_image_format_properties;
-	PFN_vkGetPhysicalDeviceMemoryProperties get_memory_properties;
+	PFN_vkGetPhysicalDeviceMemoryProperties2 get_memory_properties;
 	PFN_vkCreateImage create_image;
 	PFN_vkDestroyImage destroy_image;
-	PFN_vkGetImageMemoryRequirements get_memory_requirements;
+	PFN_vkGetImageMemoryRequirements2 get_memory_requirements;
 	PFN_vkAllocateMemory allocate_memory;
 	PFN_vkFreeMemory free_memory;
-	PFN_vkBindImageMemory bind_memory;
-	PFN_vkGetImageSubresourceLayout get_subresource_layout;
+	PFN_vkBindImageMemory2 bind_memory;
+	PFN_vkGetImageSubresourceLayout2 get_subresource_layout;
 	PFN_vkGetMemoryFdKHR get_memory_fd;
 	PFN_vkGetImageDrmFormatModifierPropertiesEXT get_image_modifier;
 };
 
 /*
- * The physical device with poor_wl_vulkan_device_extensions of 'device', the primary or the render node that the
+ * The Vulkan 1.4 physical device with poor_wl_vulkan_device_extensions of 'device', the primary or the render node that the
  * dmabuf feedback names. Its render node, for explicit synchronization, has 'render_minor'. Returns VK_NULL_HANDLE
  * if there is none.
  */
 VkPhysicalDevice
 poor_wl_vulkan_find_device(PFN_vkGetInstanceProcAddr get_proc, VkInstance instance, dev_t device, uint32_t *render_minor);
 
-/* Images for 'usage' on 'device', which has poor_wl_vulkan_device_extensions and Vulkan 1.1 */
+/* Images for 'usage' on 'device', which has poor_wl_vulkan_device_extensions and Vulkan 1.4 */
 void
 poor_wl_vulkan_init(struct poor_wl_vulkan *vulkan, struct poor_loop *loop, PFN_vkGetInstanceProcAddr get_proc,
 		    VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkImageUsageFlags usage);

@@ -65,7 +65,7 @@ static bool vulkan_start(struct client *c, dev_t device)
 	VkApplicationInfo application = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 		.pApplicationName = "vulkan-test",
-		.apiVersion = VK_API_VERSION_1_3,
+		.apiVersion = VK_API_VERSION_1_4,
 	};
 	VkInstanceCreateInfo instance_info = {
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -73,6 +73,7 @@ static bool vulkan_start(struct client *c, dev_t device)
 	};
 	VkPhysicalDeviceVulkan13Features features = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		.synchronization2 = VK_TRUE,
 		.dynamicRendering = VK_TRUE,
 	};
 	VkDeviceQueueCreateInfo queue_info = {
@@ -80,6 +81,7 @@ static bool vulkan_start(struct client *c, dev_t device)
 		.queueCount = 1,
 		.pQueuePriorities = &priority,
 	};
+	VkDeviceQueueInfo2 queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2 };
 	VkDeviceCreateInfo device_info = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = &features,
@@ -97,34 +99,34 @@ static bool vulkan_start(struct client *c, dev_t device)
 		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
 	};
 	VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
-	VkQueueFamilyProperties families[16];
+	VkQueueFamilyProperties2 families[16];
 	uint32_t count = ARRAY_SIZE(families), render_minor;
-	VkPhysicalDeviceProperties properties;
 
 	assert(vkCreateInstance(&instance_info, nullptr, &c->instance) == VK_SUCCESS);
 	keep_loaded();
 	c->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, c->instance, device, &render_minor);
-	if (c->physical)
-		vkGetPhysicalDeviceProperties(c->physical, &properties);
-	if (!c->physical || properties.apiVersion < VK_API_VERSION_1_3) {
+	if (!c->physical) {
 		vkDestroyInstance(c->instance, nullptr);
 		return false;
 	}
 	assert(render_minor == minor(device));
-	vkGetPhysicalDeviceQueueFamilyProperties(c->physical, &count, families);
+	foreach_array_ref(families, properties) {
+		properties->sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+		properties->pNext = nullptr;
+	}
+	vkGetPhysicalDeviceQueueFamilyProperties2(c->physical, &count, families);
 	c->family = count;
 	foreach_array_index(arrview_first(count, families), i) {
-		if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+		if (families[i].queueFamilyProperties.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
 			c->family = i;
 			break;
 		}
 	}
 	assert(c->family < count);
-	queue_info.queueFamilyIndex = c->family;
-	pool_info.queueFamilyIndex = c->family;
+	queue_info.queueFamilyIndex = queue.queueFamilyIndex = pool_info.queueFamilyIndex = c->family;
 	assert(vkCreateDevice(c->physical, &device_info, nullptr, &c->device) == VK_SUCCESS);
 	keep_loaded();
-	vkGetDeviceQueue(c->device, c->family, 0, &c->queue);
+	vkGetDeviceQueue2(c->device, &queue, &c->queue);
 	c->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(c->device, "vkGetSemaphoreFdKHR");
 	assert(vkCreateCommandPool(c->device, &pool_info, nullptr, &c->pool) == VK_SUCCESS);
 	assert(vkCreateSemaphore(c->device, &semaphore_info, nullptr, &c->rendered) == VK_SUCCESS);
@@ -144,9 +146,9 @@ static void vulkan_stop(struct client *c)
 /* Up to half of the format table gets the modifiers that the driver draws 'format' into, then linear */
 static unsigned add_format(struct client *c, uint32_t format, unsigned n)
 {
-	VkDrmFormatModifierPropertiesEXT driver[64];
-	VkDrmFormatModifierPropertiesListEXT list = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+	VkDrmFormatModifierProperties2EXT driver[64];
+	VkDrmFormatModifierPropertiesList2EXT list = {
+		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
 		.drmFormatModifierCount = ARRAY_SIZE(driver),
 		.pDrmFormatModifierProperties = driver,
 	};
@@ -155,7 +157,7 @@ static unsigned add_format(struct client *c, uint32_t format, unsigned n)
 
 	vkGetPhysicalDeviceFormatProperties2(c->physical, poor_wl_vulkan_format(format), &properties);
 	foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
-		if (!(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+		if (!(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT))
 			continue;
 		c->ten_bit |= format == DRM_FORMAT_XRGB2101010;
 		if (n == end || listed->drmFormatModifier == DRM_FORMAT_MOD_LINEAR)
@@ -248,6 +250,17 @@ static void swapchain_device(struct poor_wl_swapchain *, dev_t)
 
 static const struct poor_wl_swapchain_rect dot[] = { { 1, 1, 8, 8 } };
 
+static void image_barrier(VkCommandBuffer commands, const VkImageMemoryBarrier2 *barrier)
+{
+	VkDependencyInfo dependency = {
+		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+		.imageMemoryBarrierCount = 1,
+		.pImageMemoryBarriers = barrier,
+	};
+
+	vkCmdPipelineBarrier2(commands, &dependency);
+}
+
 /*
  * A buffer without an age is cleared, one with an age comes back from the queue family of the compositor with its
  * contents and only gets a dot redrawn, as in simple-vulkan. The image goes to the compositor with the fence of the
@@ -265,9 +278,11 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
-	VkImageMemoryBarrier draw = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	VkImageMemoryBarrier2 draw = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+		.srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+		.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
 		.oldLayout = partial ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
 		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		.srcQueueFamilyIndex = partial ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_IGNORED,
@@ -275,9 +290,11 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
 	};
-	VkImageMemoryBarrier release = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	VkImageMemoryBarrier2 release = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+		.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+		.dstStageMask = VK_PIPELINE_STAGE_2_NONE,
 		.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
 		.srcQueueFamilyIndex = c->family,
@@ -301,12 +318,21 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.colorAttachmentCount = 1,
 		.pColorAttachments = &attachment,
 	};
-	VkSubmitInfo submit = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		.commandBufferCount = 1,
-		.pCommandBuffers = &target->commands,
-		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = &c->rendered,
+	VkCommandBufferSubmitInfo command_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+		.commandBuffer = target->commands,
+	};
+	VkSemaphoreSubmitInfo signal = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+		.semaphore = c->rendered,
+		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+	};
+	VkSubmitInfo2 submit = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+		.commandBufferInfoCount = 1,
+		.pCommandBufferInfos = &command_info,
+		.signalSemaphoreInfoCount = 1,
+		.pSignalSemaphoreInfos = &signal,
 	};
 	VkSemaphoreGetFdInfoKHR get = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
@@ -319,16 +345,14 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	assert(vkGetFenceStatus(c->device, target->done) == VK_SUCCESS);
 	assert(vkResetFences(c->device, 1, &target->done) == VK_SUCCESS);
 	assert(vkBeginCommandBuffer(target->commands, &begin) == VK_SUCCESS);
-	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &draw);
+	image_barrier(target->commands, &draw);
 	vkCmdBeginRendering(target->commands, &rendering);
 	if (partial)
 		vkCmdClearAttachments(target->commands, 1, &fill, 1, &clear);
 	vkCmdEndRendering(target->commands);
-	vkCmdPipelineBarrier(target->commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+	image_barrier(target->commands, &release);
 	assert(vkEndCommandBuffer(target->commands) == VK_SUCCESS);
-	assert(vkQueueSubmit(c->queue, 1, &submit, target->done) == VK_SUCCESS);
+	assert(vkQueueSubmit2(c->queue, 1, &submit, target->done) == VK_SUCCESS);
 	assert(c->get_semaphore_fd(c->device, &get, &fence) == VK_SUCCESS);
 	c->frames++;
 	c->partial_frames += partial;

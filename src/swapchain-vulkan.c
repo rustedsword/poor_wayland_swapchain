@@ -64,7 +64,7 @@ POOR_WL_EXPORT VkPhysicalDevice poor_wl_vulkan_find_device(PFN_vkGetInstanceProc
 		if (!has_extensions(enumerate_extensions, *physical))
 			continue;
 		get_properties(*physical, &properties);
-		if (!drm.hasRender)
+		if (properties.properties.apiVersion < VK_API_VERSION_1_4 || !drm.hasRender)
 			continue;
 		if ((drm.hasPrimary && major(device) == drm.primaryMajor && minor(device) == drm.primaryMinor) ||
 		    (major(device) == drm.renderMajor && minor(device) == drm.renderMinor)) {
@@ -89,19 +89,20 @@ POOR_WL_EXPORT void poor_wl_vulkan_init(struct poor_wl_vulkan *vulkan, struct po
 	vulkan->get_image_format_properties =
 		(PFN_vkGetPhysicalDeviceImageFormatProperties2)get_proc(instance, "vkGetPhysicalDeviceImageFormatProperties2");
 	vulkan->get_memory_properties =
-		(PFN_vkGetPhysicalDeviceMemoryProperties)get_proc(instance, "vkGetPhysicalDeviceMemoryProperties");
+		(PFN_vkGetPhysicalDeviceMemoryProperties2)get_proc(instance, "vkGetPhysicalDeviceMemoryProperties2");
 	vulkan->create_image = (PFN_vkCreateImage)get_device_proc(device, "vkCreateImage");
 	vulkan->destroy_image = (PFN_vkDestroyImage)get_device_proc(device, "vkDestroyImage");
 	vulkan->get_memory_requirements =
-		(PFN_vkGetImageMemoryRequirements)get_device_proc(device, "vkGetImageMemoryRequirements");
+		(PFN_vkGetImageMemoryRequirements2)get_device_proc(device, "vkGetImageMemoryRequirements2");
 	vulkan->allocate_memory = (PFN_vkAllocateMemory)get_device_proc(device, "vkAllocateMemory");
 	vulkan->free_memory = (PFN_vkFreeMemory)get_device_proc(device, "vkFreeMemory");
-	vulkan->bind_memory = (PFN_vkBindImageMemory)get_device_proc(device, "vkBindImageMemory");
-	vulkan->get_subresource_layout = (PFN_vkGetImageSubresourceLayout)get_device_proc(device, "vkGetImageSubresourceLayout");
+	vulkan->bind_memory = (PFN_vkBindImageMemory2)get_device_proc(device, "vkBindImageMemory2");
+	vulkan->get_subresource_layout =
+		(PFN_vkGetImageSubresourceLayout2)get_device_proc(device, "vkGetImageSubresourceLayout2");
 	vulkan->get_memory_fd = (PFN_vkGetMemoryFdKHR)get_device_proc(device, "vkGetMemoryFdKHR");
 	vulkan->get_image_modifier =
 		(PFN_vkGetImageDrmFormatModifierPropertiesEXT)get_device_proc(device, "vkGetImageDrmFormatModifierPropertiesEXT");
-	assert(vulkan->get_memory_fd && vulkan->get_image_modifier);
+	assert(vulkan->get_subresource_layout && vulkan->get_memory_fd && vulkan->get_image_modifier);
 }
 
 /*
@@ -168,13 +169,13 @@ static bool exportable(struct poor_wl_vulkan *vulkan, VkFormat format, uint64_t 
 }
 
 /* The format features that the usage needs, for the modifiers that the driver lists */
-static VkFormatFeatureFlags usage_features(VkImageUsageFlags usage)
+static VkFormatFeatureFlags2 usage_features(VkImageUsageFlags usage)
 {
-	return (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT : 0) |
-	       (usage & VK_IMAGE_USAGE_STORAGE_BIT ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : 0) |
-	       (usage & VK_IMAGE_USAGE_SAMPLED_BIT ? VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT : 0) |
-	       (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT ? VK_FORMAT_FEATURE_TRANSFER_DST_BIT : 0) |
-	       (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT ? VK_FORMAT_FEATURE_TRANSFER_SRC_BIT : 0);
+	return (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT ? VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT : 0) |
+	       (usage & VK_IMAGE_USAGE_STORAGE_BIT ? VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT : 0) |
+	       (usage & VK_IMAGE_USAGE_SAMPLED_BIT ? VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT : 0) |
+	       (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT ? VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT : 0) |
+	       (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT : 0);
 }
 
 /* The modifiers of the tranche that the driver has for the usage and shares, with their numbers of memory planes */
@@ -182,14 +183,14 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 				 unsigned count, const uint64_t (*modifiers)[count], uint64_t (*usable)[count],
 				 uint32_t (*planes)[count])
 {
-	VkDrmFormatModifierPropertiesEXT driver[DRIVER_MODIFIERS];
-	VkDrmFormatModifierPropertiesListEXT list = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+	VkDrmFormatModifierProperties2EXT driver[DRIVER_MODIFIERS];
+	VkDrmFormatModifierPropertiesList2EXT list = {
+		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
 		.drmFormatModifierCount = ARRAY_SIZE(driver),
 		.pDrmFormatModifierProperties = driver,
 	};
 	VkFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list };
-	VkFormatFeatureFlags features = usage_features(vulkan->usage);
+	VkFormatFeatureFlags2 features = usage_features(vulkan->usage);
 	unsigned n = 0;
 
 	vulkan->get_format_properties(vulkan->physical, format, &properties);
@@ -211,8 +212,10 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 /* Device local memory if there is, the image has the memory for itself */
 static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_image *image, const VkImageCreateInfo *info)
 {
-	VkPhysicalDeviceMemoryProperties memory;
-	VkMemoryRequirements requirements;
+	VkPhysicalDeviceMemoryProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+	const VkPhysicalDeviceMemoryProperties *memory = &properties.memoryProperties;
+	VkImageMemoryRequirementsInfo2 requirements_info = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
+	VkMemoryRequirements2 requirements = { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
 	VkMemoryDedicatedAllocateInfo dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
 	VkExportMemoryAllocateInfo export = {
 		.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
@@ -220,6 +223,7 @@ static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_
 		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 	};
 	VkMemoryAllocateInfo allocate = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export };
+	VkBindImageMemoryInfo bind = { .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO };
 	uint32_t type = UINT32_MAX;
 	VkResult result;
 
@@ -229,27 +233,28 @@ static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_
 		image->image = VK_NULL_HANDLE;
 		return result;
 	}
-	vulkan->get_memory_requirements(vulkan->device, image->image, &requirements);
-	vulkan->get_memory_properties(vulkan->physical, &memory);
-	foreach_array_index(arrview_first(memory.memoryTypeCount, memory.memoryTypes), i) {
-		if (!(requirements.memoryTypeBits & 1u << i))
+	requirements_info.image = dedicated.image = bind.image = image->image;
+	vulkan->get_memory_requirements(vulkan->device, &requirements_info, &requirements);
+	vulkan->get_memory_properties(vulkan->physical, &properties);
+	foreach_array_index(arrview_first(memory->memoryTypeCount, memory->memoryTypes), i) {
+		if (!(requirements.memoryRequirements.memoryTypeBits & 1u << i))
 			continue;
-		if (type == UINT32_MAX || memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+		if (type == UINT32_MAX || memory->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 			type = i;
-		if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+		if (memory->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 			break;
 	}
 	if (type == UINT32_MAX)
 		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-	dedicated.image = image->image;
-	allocate.allocationSize = requirements.size;
+	allocate.allocationSize = requirements.memoryRequirements.size;
 	allocate.memoryTypeIndex = type;
 	result = vulkan->allocate_memory(vulkan->device, &allocate, nullptr, &image->memory);
 	if (result != VK_SUCCESS) {
 		image->memory = VK_NULL_HANDLE;
 		return result;
 	}
-	return vulkan->bind_memory(vulkan->device, image->image, image->memory, 0);
+	bind.memory = image->memory;
+	return vulkan->bind_memory(vulkan->device, 1, &bind);
 }
 
 static void image_fini(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_image *image)
@@ -267,11 +272,14 @@ static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulka
 		.memory = image->memory,
 		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 	};
-	VkSubresourceLayout layout;
+	VkSubresourceLayout2 layout = { .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2 };
 	VkResult result;
 
 	foreach_array_index(arrview_first(planes, buffer->planes), i) {
-		VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i };
+		VkImageSubresource2 subresource = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+			.imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i },
+		};
 
 		result = vulkan->get_memory_fd(vulkan->device, &get, &buffer->planes[i].fd);
 		if (result != VK_SUCCESS) {
@@ -280,8 +288,8 @@ static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulka
 			return result;
 		}
 		vulkan->get_subresource_layout(vulkan->device, image->image, &subresource, &layout);
-		buffer->planes[i].offset = layout.offset;
-		buffer->planes[i].stride = layout.rowPitch;
+		buffer->planes[i].offset = layout.subresourceLayout.offset;
+		buffer->planes[i].stride = layout.subresourceLayout.rowPitch;
 	}
 	buffer->plane_count = planes;
 	return VK_SUCCESS;

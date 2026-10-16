@@ -18,7 +18,7 @@ int main(int argc, char **argv)
 	const VkApplicationInfo application = {
 		.sType = report_error ? VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO : VK_STRUCTURE_TYPE_APPLICATION_INFO,
 		.pApplicationName = "vulkan-validation-probe",
-		.apiVersion = VK_API_VERSION_1_3,
+		.apiVersion = VK_API_VERSION_1_4,
 	};
 	const VkInstanceCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
