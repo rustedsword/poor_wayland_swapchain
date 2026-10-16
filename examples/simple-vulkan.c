@@ -17,7 +17,7 @@
 #include <sys/signalfd.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-#include <vulkan/vulkan.h>
+#include <vk_init.h>
 
 #include "example-log.h"
 #include "poor_wayland_client_display.h"
@@ -154,31 +154,23 @@ static void on_idle(struct poor_loop *, struct poor_loop_op *op, const struct io
 /* An empty batch signals once all drawing before it is done, -1 means that it is or that the fence failed */
 static int idle_fence(struct app *app)
 {
-	VkExportSemaphoreCreateInfo export = {
-		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
-	VkSemaphoreCreateInfo info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
-	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-	VkSemaphoreSubmitInfo signal = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-	};
-	VkSubmitInfo2 submit = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-		.signalSemaphoreInfoCount = 1,
-		.pSignalSemaphoreInfos = &signal,
-	};
-	VkSemaphoreGetFdInfoKHR get = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
-		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
+	auto info = xVkSemaphoreCreateInfo(
+		.pNext = &xVkExportSemaphoreCreateInfo(.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT),
+	);
 	int fd = -1;
 
 	if (!check(vkCreateSemaphore(app->device, &info, nullptr, &app->idle), "vkCreateSemaphore") ||
-	    !check(vkCreateFence(app->device, &fence_info, nullptr, &app->drained), "vkCreateFence"))
+	    !check(vkCreateFence(app->device, &xVkFenceCreateInfo(), nullptr, &app->drained), "vkCreateFence"))
 		return -1;
-	signal.semaphore = get.semaphore = app->idle;
+	auto submit = xVkSubmitInfo2(
+		.signalSemaphoreInfoCount = 1,
+		.pSignalSemaphoreInfos = &xVkSemaphoreSubmitInfo(
+			.semaphore = app->idle,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		),
+	);
+	auto get = xVkSemaphoreGetFdInfoKHR(.semaphore = app->idle, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+
 	if (!check(vkQueueSubmit2(app->queue, 1, &submit, app->drained), "vkQueueSubmit2"))
 		return -1;
 	check(app->get_semaphore_fd(app->device, &get, &fd), "vkGetSemaphoreFdKHR");
@@ -223,20 +215,18 @@ static void target_fini(struct app *app, struct target *target)
 
 static bool target_init(struct app *app, struct target *target, const struct poor_wl_vulkan_image *image)
 {
-	VkImageViewCreateInfo view_info = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	auto view_info = xVkImageViewCreateInfo(
 		.image = image->image,
 		.viewType = VK_IMAGE_VIEW_TYPE_2D,
 		.format = image->format,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkCommandBufferAllocateInfo commands_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	);
+	auto commands_info = xVkCommandBufferAllocateInfo(
 		.commandPool = app->pool,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		.commandBufferCount = 1,
-	};
-	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+	);
+	auto fence_info = xVkFenceCreateInfo(.flags = VK_FENCE_CREATE_SIGNALED_BIT);
 
 	target->view = VK_NULL_HANDLE;
 	target->commands = VK_NULL_HANDLE;
@@ -288,10 +278,8 @@ static bool device_queue_family(VkPhysicalDevice physical, uint32_t *family)
 	VkQueueFamilyProperties2 families[16];
 	uint32_t count = ARRAY_SIZE(families);
 
-	foreach_array_ref(families, properties) {
-		properties->sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
-		properties->pNext = nullptr;
-	}
+	foreach_array_ref(families, properties)
+		*properties = xVkQueueFamilyProperties2();
 	vkGetPhysicalDeviceQueueFamilyProperties2(physical, &count, families);
 	foreach_array_index(arrview_first(count, families), i) {
 		if (families[i].queueFamilyProperties.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
@@ -304,11 +292,8 @@ static bool device_queue_family(VkPhysicalDevice physical, uint32_t *family)
 
 static bool device_exports_fences(VkPhysicalDevice physical)
 {
-	VkPhysicalDeviceExternalSemaphoreInfo info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
-		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
-	VkExternalSemaphoreProperties properties = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+	auto info = xVkPhysicalDeviceExternalSemaphoreInfo(.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+	auto properties = xVkExternalSemaphoreProperties();
 
 	vkGetPhysicalDeviceExternalSemaphoreProperties(physical, &info, &properties);
 	return properties.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;
@@ -317,48 +302,13 @@ static bool device_exports_fences(VkPhysicalDevice physical)
 static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 {
 	static const float priority = 1.0f;
-	VkApplicationInfo application = {
-		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = "simple-vulkan",
-		.apiVersion = VK_API_VERSION_1_4,
-	};
-	VkInstanceCreateInfo instance_info = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pApplicationInfo = &application,
-	};
-	VkPhysicalDeviceVulkan13Features features = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-		.synchronization2 = VK_TRUE,
-		.dynamicRendering = VK_TRUE,
-	};
-	VkDeviceQueueCreateInfo queue_info = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-		.queueCount = 1,
-		.pQueuePriorities = &priority,
-	};
-	VkDeviceQueueInfo2 queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2 };
-	VkDeviceCreateInfo device_info = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.pNext = &features,
-		.queueCreateInfoCount = 1,
-		.pQueueCreateInfos = &queue_info,
-		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
-		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
-	};
-	VkCommandPoolCreateInfo pool_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
-	VkExportSemaphoreCreateInfo export = {
-		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
-	VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
-	VkPhysicalDeviceProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+	auto application = xVkApplicationInfo(.pApplicationName = "simple-vulkan", .apiVersion = VK_API_VERSION_1_4);
+	auto properties = xVkPhysicalDeviceProperties2();
 
 	/* Mesa's device-select layer would connect to the compositor with the system libwayland and block, to sort GPUs */
 	setenv("NODEVICE_SELECT", "1", 1);
-	if (!check(vkCreateInstance(&instance_info, nullptr, &app->instance), "vkCreateInstance"))
+	if (!check(vkCreateInstance(&xVkInstanceCreateInfo(.pApplicationInfo = &application), nullptr, &app->instance),
+		   "vkCreateInstance"))
 		return false;
 	app->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, app->instance, device, render_minor);
 	if (app->physical) {
@@ -370,10 +320,28 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 			   minor(device));
 		return false;
 	}
-	queue_info.queueFamilyIndex = queue.queueFamilyIndex = pool_info.queueFamilyIndex = app->family;
+	auto device_info = xVkDeviceCreateInfo(
+		.pNext = &xVkPhysicalDeviceVulkan13Features(.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE),
+		.queueCreateInfoCount = 1,
+		.pQueueCreateInfos = &xVkDeviceQueueCreateInfo(
+			.queueFamilyIndex = app->family,
+			.queueCount = 1,
+			.pQueuePriorities = &priority,
+		),
+		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
+		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
+	);
+	auto pool_info = xVkCommandPoolCreateInfo(
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		.queueFamilyIndex = app->family,
+	);
+	auto semaphore_info = xVkSemaphoreCreateInfo(
+		.pNext = &xVkExportSemaphoreCreateInfo(.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT),
+	);
+
 	if (!check(vkCreateDevice(app->physical, &device_info, nullptr, &app->device), "vkCreateDevice"))
 		return false;
-	vkGetDeviceQueue2(app->device, &queue, &app->queue);
+	vkGetDeviceQueue2(app->device, &xVkDeviceQueueInfo2(.queueFamilyIndex = app->family), &app->queue);
 	app->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(app->device, "vkGetSemaphoreFdKHR");
 	poor_wl_vulkan_init(&app->vulkan, &app->loop, vkGetInstanceProcAddr, app->instance, app->physical, app->device,
 			    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
@@ -481,13 +449,7 @@ static bool clear_rect(const struct poor_wl_swapchain_rect *rect, int32_t width,
 
 static void image_barrier(VkCommandBuffer commands, const VkImageMemoryBarrier2 *barrier)
 {
-	VkDependencyInfo dependency = {
-		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-		.imageMemoryBarrierCount = 1,
-		.pImageMemoryBarriers = barrier,
-	};
-
-	vkCmdPipelineBarrier2(commands, &dependency);
+	vkCmdPipelineBarrier2(commands, &xVkDependencyInfo(.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = barrier));
 }
 
 /*
@@ -511,12 +473,8 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	VkClearAttachment fill = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = { .color = background } };
 	VkClearAttachment paint = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = { .color = hue(time) } };
 	uint32_t count = 0;
-	VkCommandBufferBeginInfo begin = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	VkImageMemoryBarrier2 draw = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+	auto begin = xVkCommandBufferBeginInfo(.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+	auto draw = xVkImageMemoryBarrier2(
 		.srcStageMask = VK_PIPELINE_STAGE_2_NONE,
 		.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -526,9 +484,8 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.dstQueueFamilyIndex = full ? VK_QUEUE_FAMILY_IGNORED : app->family,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkImageMemoryBarrier2 release = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+	);
+	auto release = xVkImageMemoryBarrier2(
 		.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstStageMask = VK_PIPELINE_STAGE_2_NONE,
@@ -538,43 +495,32 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkRenderingAttachmentInfo attachment = {
-		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-		.imageView = target->view,
-		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.loadOp = full ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-		.clearValue = { .color = background },
-	};
-	VkRenderingInfo rendering = {
-		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+	);
+	auto rendering = xVkRenderingInfo(
 		.renderArea = { .extent = { (uint32_t)buffer->width, (uint32_t)buffer->height } },
 		.layerCount = 1,
 		.colorAttachmentCount = 1,
-		.pColorAttachments = &attachment,
-	};
-	VkCommandBufferSubmitInfo command_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-		.commandBuffer = target->commands,
-	};
-	VkSemaphoreSubmitInfo signal = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-		.semaphore = app->rendered,
-		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-	};
-	VkSubmitInfo2 submit = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+		.pColorAttachments = &xVkRenderingAttachmentInfo(
+			.imageView = target->view,
+			.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			.loadOp = full ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.clearValue = { .color = background },
+		),
+	);
+	auto submit = xVkSubmitInfo2(
 		.commandBufferInfoCount = 1,
-		.pCommandBufferInfos = &command_info,
+		.pCommandBufferInfos = &xVkCommandBufferSubmitInfo(.commandBuffer = target->commands),
 		.signalSemaphoreInfoCount = 1,
-		.pSignalSemaphoreInfos = &signal,
-	};
-	VkSemaphoreGetFdInfoKHR get = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.pSignalSemaphoreInfos = &xVkSemaphoreSubmitInfo(
+			.semaphore = app->rendered,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		),
+	);
+	auto get = xVkSemaphoreGetFdInfoKHR(
 		.semaphore = app->rendered,
 		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
+	);
 	int fence;
 
 	if (app->closing)

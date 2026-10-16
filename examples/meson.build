@@ -46,6 +46,6 @@ if vulkan_dep.found()
 		'example-log.c',
 		xdg_shell_client_protocol_h,
 		xdg_shell_protocol_c,
-		dependencies: [ swapchain_dep, vulkan_dep ],
+		dependencies: [ swapchain_dep, vulkan_dep, vulkan_initializers_dep ],
 	)
 endif

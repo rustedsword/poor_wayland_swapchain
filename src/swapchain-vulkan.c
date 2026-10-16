@@ -7,6 +7,7 @@
 #include <poor_loop_fd.h>
 #include <string.h>
 #include <sys/sysmacros.h>
+#include <vk_init.h>
 
 #include "poor_wayland_swapchain_vulkan.h"
 
@@ -55,11 +56,8 @@ POOR_WL_EXPORT VkPhysicalDevice poor_wl_vulkan_find_device(PFN_vkGetInstanceProc
 	if (enumerate_devices(instance, &count, physicals) < 0)
 		return VK_NULL_HANDLE;
 	foreach_array_const_ref(arrview_first(count, physicals), physical) {
-		VkPhysicalDeviceDrmPropertiesEXT drm = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT };
-		VkPhysicalDeviceProperties2 properties = {
-			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-			.pNext = &drm,
-		};
+		auto drm = xVkPhysicalDeviceDrmPropertiesEXT();
+		auto properties = xVkPhysicalDeviceProperties2(.pNext = &drm);
 
 		if (!has_extensions(enumerate_extensions, *physical))
 			continue;
@@ -141,26 +139,21 @@ POOR_WL_EXPORT VkFormat poor_wl_vulkan_format(uint32_t format)
 static bool exportable(struct poor_wl_vulkan *vulkan, VkFormat format, uint64_t modifier,
 		       const struct poor_wl_swapchain_buffer *buffer)
 {
-	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-		.drmFormatModifier = modifier,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-	};
-	VkPhysicalDeviceExternalImageFormatInfo external_info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-		.pNext = &modifier_info,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkPhysicalDeviceImageFormatInfo2 info = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-		.pNext = &external_info,
+	auto info = xVkPhysicalDeviceImageFormatInfo2(
+		.pNext = &xVkPhysicalDeviceExternalImageFormatInfo(
+			.pNext = &xVkPhysicalDeviceImageDrmFormatModifierInfoEXT(
+				.drmFormatModifier = modifier,
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			),
+			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+		),
 		.format = format,
 		.type = VK_IMAGE_TYPE_2D,
 		.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
 		.usage = vulkan->usage,
-	};
-	VkExternalImageFormatProperties external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
-	VkImageFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &external };
+	);
+	auto external = xVkExternalImageFormatProperties();
+	auto properties = xVkImageFormatProperties2(.pNext = &external);
 
 	return vulkan->get_image_format_properties(vulkan->physical, &info, &properties) == VK_SUCCESS &&
 	       external.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT &&
@@ -184,16 +177,14 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 				 uint32_t (*planes)[count])
 {
 	VkDrmFormatModifierProperties2EXT driver[DRIVER_MODIFIERS];
-	VkDrmFormatModifierPropertiesList2EXT list = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
+	auto list = xVkDrmFormatModifierPropertiesList2EXT(
 		.drmFormatModifierCount = ARRAY_SIZE(driver),
 		.pDrmFormatModifierProperties = driver,
-	};
-	VkFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list };
+	);
 	VkFormatFeatureFlags2 features = usage_features(vulkan->usage);
 	unsigned n = 0;
 
-	vulkan->get_format_properties(vulkan->physical, format, &properties);
+	vulkan->get_format_properties(vulkan->physical, format, &xVkFormatProperties2(.pNext = &list));
 	foreach_array_const_ref(modifiers, modifier) {
 		foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
 			if (listed->drmFormatModifier != *modifier ||
@@ -212,18 +203,9 @@ static unsigned usable_modifiers(struct poor_wl_vulkan *vulkan, const struct poo
 /* Device local memory if there is, the image has the memory for itself */
 static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_image *image, const VkImageCreateInfo *info)
 {
-	VkPhysicalDeviceMemoryProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2 };
+	auto properties = xVkPhysicalDeviceMemoryProperties2();
 	const VkPhysicalDeviceMemoryProperties *memory = &properties.memoryProperties;
-	VkImageMemoryRequirementsInfo2 requirements_info = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
-	VkMemoryRequirements2 requirements = { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-	VkMemoryDedicatedAllocateInfo dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
-	VkExportMemoryAllocateInfo export = {
-		.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-		.pNext = &dedicated,
-		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkMemoryAllocateInfo allocate = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &export };
-	VkBindImageMemoryInfo bind = { .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO };
+	auto requirements = xVkMemoryRequirements2();
 	uint32_t type = UINT32_MAX;
 	VkResult result;
 
@@ -233,8 +215,7 @@ static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_
 		image->image = VK_NULL_HANDLE;
 		return result;
 	}
-	requirements_info.image = dedicated.image = bind.image = image->image;
-	vulkan->get_memory_requirements(vulkan->device, &requirements_info, &requirements);
+	vulkan->get_memory_requirements(vulkan->device, &xVkImageMemoryRequirementsInfo2(.image = image->image), &requirements);
 	vulkan->get_memory_properties(vulkan->physical, &properties);
 	foreach_array_index(arrview_first(memory->memoryTypeCount, memory->memoryTypes), i) {
 		if (!(requirements.memoryRequirements.memoryTypeBits & 1u << i))
@@ -246,15 +227,20 @@ static VkResult image_init(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_
 	}
 	if (type == UINT32_MAX)
 		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-	allocate.allocationSize = requirements.memoryRequirements.size;
-	allocate.memoryTypeIndex = type;
+	auto allocate = xVkMemoryAllocateInfo(
+		.pNext = &xVkExportMemoryAllocateInfo(
+			.pNext = &xVkMemoryDedicatedAllocateInfo(.image = image->image),
+			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+		),
+		.allocationSize = requirements.memoryRequirements.size,
+		.memoryTypeIndex = type,
+	);
 	result = vulkan->allocate_memory(vulkan->device, &allocate, nullptr, &image->memory);
 	if (result != VK_SUCCESS) {
 		image->memory = VK_NULL_HANDLE;
 		return result;
 	}
-	bind.memory = image->memory;
-	return vulkan->bind_memory(vulkan->device, 1, &bind);
+	return vulkan->bind_memory(vulkan->device, 1, &xVkBindImageMemoryInfo(.image = image->image, .memory = image->memory));
 }
 
 static void image_fini(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_image *image)
@@ -267,19 +253,14 @@ static void image_fini(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_imag
 static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulkan_image *image,
 			     struct poor_wl_swapchain_buffer *buffer, uint32_t planes)
 {
-	VkMemoryGetFdInfoKHR get = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-		.memory = image->memory,
-		.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkSubresourceLayout2 layout = { .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2 };
+	auto get = xVkMemoryGetFdInfoKHR(.memory = image->memory, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+	auto layout = xVkSubresourceLayout2();
 	VkResult result;
 
 	foreach_array_index(arrview_first(planes, buffer->planes), i) {
-		VkImageSubresource2 subresource = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+		auto subresource = xVkImageSubresource2(
 			.imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i },
-		};
+		);
 
 		result = vulkan->get_memory_fd(vulkan->device, &get, &buffer->planes[i].fd);
 		if (result != VK_SUCCESS) {
@@ -311,19 +292,14 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 		return -ENOTSUP;
 	n = usable_modifiers(vulkan, buffer, vulkan_format, count, modifiers, arrview_first(count, usable),
 			     arrview_first(count, planes));
-	VkImageDrmFormatModifierListCreateInfoEXT modifier_list = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-		.drmFormatModifierCount = n,
-		.pDrmFormatModifiers = usable,
-	};
-	VkExternalMemoryImageCreateInfo external = {
-		.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-		.pNext = &modifier_list,
-		.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-	};
-	VkImageCreateInfo info = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-		.pNext = &external,
+	auto info = xVkImageCreateInfo(
+		.pNext = &xVkExternalMemoryImageCreateInfo(
+			.pNext = &xVkImageDrmFormatModifierListCreateInfoEXT(
+				.drmFormatModifierCount = n,
+				.pDrmFormatModifiers = usable,
+			),
+			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+		),
 		.imageType = VK_IMAGE_TYPE_2D,
 		.format = vulkan_format,
 		.extent = { (uint32_t)buffer->width, (uint32_t)buffer->height, 1 },
@@ -334,8 +310,8 @@ static int vulkan_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, 
 		.usage = vulkan->usage,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	};
-	VkImageDrmFormatModifierPropertiesEXT chosen = { .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
+	);
+	auto chosen = xVkImageDrmFormatModifierPropertiesEXT();
 
 	if (!n)
 		return -ENOTSUP;

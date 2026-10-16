@@ -5,7 +5,7 @@
 #include <drm/drm_fourcc.h>
 #include <string.h>
 #include <sys/sysmacros.h>
-#include <vulkan/vulkan.h>
+#include <vk_init.h>
 
 #include "keep-loaded.h"
 #include "poor_wayland_client_display.h"
@@ -62,47 +62,11 @@ static struct client *client_of(struct poor_wl_swapchain *swapchain)
 static bool vulkan_start(struct client *c, dev_t device)
 {
 	static const float priority = 1.0f;
-	VkApplicationInfo application = {
-		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = "vulkan-test",
-		.apiVersion = VK_API_VERSION_1_4,
-	};
-	VkInstanceCreateInfo instance_info = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pApplicationInfo = &application,
-	};
-	VkPhysicalDeviceVulkan13Features features = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-		.synchronization2 = VK_TRUE,
-		.dynamicRendering = VK_TRUE,
-	};
-	VkDeviceQueueCreateInfo queue_info = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-		.queueCount = 1,
-		.pQueuePriorities = &priority,
-	};
-	VkDeviceQueueInfo2 queue = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2 };
-	VkDeviceCreateInfo device_info = {
-		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.pNext = &features,
-		.queueCreateInfoCount = 1,
-		.pQueueCreateInfos = &queue_info,
-		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
-		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
-	};
-	VkCommandPoolCreateInfo pool_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
-	VkExportSemaphoreCreateInfo export = {
-		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
-	VkSemaphoreCreateInfo semaphore_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export };
+	auto application = xVkApplicationInfo(.pApplicationName = "vulkan-test", .apiVersion = VK_API_VERSION_1_4);
 	VkQueueFamilyProperties2 families[16];
 	uint32_t count = ARRAY_SIZE(families), render_minor;
 
-	assert(vkCreateInstance(&instance_info, nullptr, &c->instance) == VK_SUCCESS);
+	assert(vkCreateInstance(&xVkInstanceCreateInfo(.pApplicationInfo = &application), nullptr, &c->instance) == VK_SUCCESS);
 	keep_loaded();
 	c->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, c->instance, device, &render_minor);
 	if (!c->physical) {
@@ -110,10 +74,8 @@ static bool vulkan_start(struct client *c, dev_t device)
 		return false;
 	}
 	assert(render_minor == minor(device));
-	foreach_array_ref(families, properties) {
-		properties->sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
-		properties->pNext = nullptr;
-	}
+	foreach_array_ref(families, properties)
+		*properties = xVkQueueFamilyProperties2();
 	vkGetPhysicalDeviceQueueFamilyProperties2(c->physical, &count, families);
 	c->family = count;
 	foreach_array_index(arrview_first(count, families), i) {
@@ -123,10 +85,28 @@ static bool vulkan_start(struct client *c, dev_t device)
 		}
 	}
 	assert(c->family < count);
-	queue_info.queueFamilyIndex = queue.queueFamilyIndex = pool_info.queueFamilyIndex = c->family;
+	auto device_info = xVkDeviceCreateInfo(
+		.pNext = &xVkPhysicalDeviceVulkan13Features(.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE),
+		.queueCreateInfoCount = 1,
+		.pQueueCreateInfos = &xVkDeviceQueueCreateInfo(
+			.queueFamilyIndex = c->family,
+			.queueCount = 1,
+			.pQueuePriorities = &priority,
+		),
+		.enabledExtensionCount = ARRAY_SIZE(poor_wl_vulkan_device_extensions),
+		.ppEnabledExtensionNames = poor_wl_vulkan_device_extensions,
+	);
+	auto pool_info = xVkCommandPoolCreateInfo(
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		.queueFamilyIndex = c->family,
+	);
+	auto semaphore_info = xVkSemaphoreCreateInfo(
+		.pNext = &xVkExportSemaphoreCreateInfo(.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT),
+	);
+
 	assert(vkCreateDevice(c->physical, &device_info, nullptr, &c->device) == VK_SUCCESS);
 	keep_loaded();
-	vkGetDeviceQueue2(c->device, &queue, &c->queue);
+	vkGetDeviceQueue2(c->device, &xVkDeviceQueueInfo2(.queueFamilyIndex = c->family), &c->queue);
 	c->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(c->device, "vkGetSemaphoreFdKHR");
 	assert(vkCreateCommandPool(c->device, &pool_info, nullptr, &c->pool) == VK_SUCCESS);
 	assert(vkCreateSemaphore(c->device, &semaphore_info, nullptr, &c->rendered) == VK_SUCCESS);
@@ -147,15 +127,13 @@ static void vulkan_stop(struct client *c)
 static unsigned add_format(struct client *c, uint32_t format, unsigned n)
 {
 	VkDrmFormatModifierProperties2EXT driver[64];
-	VkDrmFormatModifierPropertiesList2EXT list = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
+	auto list = xVkDrmFormatModifierPropertiesList2EXT(
 		.drmFormatModifierCount = ARRAY_SIZE(driver),
 		.pDrmFormatModifierProperties = driver,
-	};
-	VkFormatProperties2 properties = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &list };
+	);
 	unsigned end = n + ARRAY_SIZE(swapchain_server.table) / 2 - 1;
 
-	vkGetPhysicalDeviceFormatProperties2(c->physical, poor_wl_vulkan_format(format), &properties);
+	vkGetPhysicalDeviceFormatProperties2(c->physical, poor_wl_vulkan_format(format), &xVkFormatProperties2(.pNext = &list));
 	foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
 		if (!(listed->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT))
 			continue;
@@ -201,24 +179,23 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 {
 	struct client *c = data;
 	struct target *target = target_of(c, buffer);
-	VkImageViewCreateInfo view_info = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.viewType = VK_IMAGE_VIEW_TYPE_2D,
-		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkCommandBufferAllocateInfo commands_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	auto commands_info = xVkCommandBufferAllocateInfo(
 		.commandPool = c->pool,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		.commandBufferCount = 1,
-	};
-	VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
+	);
+	auto fence_info = xVkFenceCreateInfo(.flags = VK_FENCE_CREATE_SIGNALED_BIT);
 	int ret = poor_wl_vulkan_allocator.allocate(&c->vulkan, buffer, format, count, modifiers, scanout);
 
 	if (ret < 0)
 		return ret;
-	view_info.image = ((struct poor_wl_vulkan_image *)buffer->data)->image;
-	view_info.format = ((struct poor_wl_vulkan_image *)buffer->data)->format;
+	const struct poor_wl_vulkan_image *image = buffer->data;
+	auto view_info = xVkImageViewCreateInfo(
+		.image = image->image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = image->format,
+		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
+	);
 	assert(vkCreateImageView(c->device, &view_info, nullptr, &target->view) == VK_SUCCESS);
 	assert(vkAllocateCommandBuffers(c->device, &commands_info, &target->commands) == VK_SUCCESS);
 	assert(vkCreateFence(c->device, &fence_info, nullptr, &target->done) == VK_SUCCESS);
@@ -252,13 +229,7 @@ static const struct poor_wl_swapchain_rect dot[] = { { 1, 1, 8, 8 } };
 
 static void image_barrier(VkCommandBuffer commands, const VkImageMemoryBarrier2 *barrier)
 {
-	VkDependencyInfo dependency = {
-		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-		.imageMemoryBarrierCount = 1,
-		.pImageMemoryBarriers = barrier,
-	};
-
-	vkCmdPipelineBarrier2(commands, &dependency);
+	vkCmdPipelineBarrier2(commands, &xVkDependencyInfo(.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = barrier));
 }
 
 /*
@@ -274,12 +245,8 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	bool partial = buffer->age;
 	VkClearRect clear = { .rect = { { dot[0].x, dot[0].y }, { (uint32_t)dot[0].width, (uint32_t)dot[0].height } },
 			      .layerCount = 1 };
-	VkCommandBufferBeginInfo begin = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	VkImageMemoryBarrier2 draw = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+	auto begin = xVkCommandBufferBeginInfo(.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+	auto draw = xVkImageMemoryBarrier2(
 		.srcStageMask = VK_PIPELINE_STAGE_2_NONE,
 		.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -289,9 +256,8 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.dstQueueFamilyIndex = partial ? c->family : VK_QUEUE_FAMILY_IGNORED,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkImageMemoryBarrier2 release = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+	);
+	auto release = xVkImageMemoryBarrier2(
 		.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstStageMask = VK_PIPELINE_STAGE_2_NONE,
@@ -301,44 +267,34 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
 		.image = image,
 		.subresourceRange = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
-	};
-	VkRenderingAttachmentInfo attachment = {
-		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+	);
+	auto attachment = xVkRenderingAttachmentInfo(
 		.imageView = target->view,
 		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		.loadOp = partial ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR,
 		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 		.clearValue = { .color = { .float32 = { 0.25f * (c->frames % 4), 0.5f, 1.0f, 1.0f } } },
-	};
+	);
 	VkClearAttachment fill = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue = attachment.clearValue };
-	VkRenderingInfo rendering = {
-		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+	auto rendering = xVkRenderingInfo(
 		.renderArea = { .extent = { (uint32_t)buffer->width, (uint32_t)buffer->height } },
 		.layerCount = 1,
 		.colorAttachmentCount = 1,
 		.pColorAttachments = &attachment,
-	};
-	VkCommandBufferSubmitInfo command_info = {
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-		.commandBuffer = target->commands,
-	};
-	VkSemaphoreSubmitInfo signal = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-		.semaphore = c->rendered,
-		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-	};
-	VkSubmitInfo2 submit = {
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+	);
+	auto submit = xVkSubmitInfo2(
 		.commandBufferInfoCount = 1,
-		.pCommandBufferInfos = &command_info,
+		.pCommandBufferInfos = &xVkCommandBufferSubmitInfo(.commandBuffer = target->commands),
 		.signalSemaphoreInfoCount = 1,
-		.pSignalSemaphoreInfos = &signal,
-	};
-	VkSemaphoreGetFdInfoKHR get = {
-		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.pSignalSemaphoreInfos = &xVkSemaphoreSubmitInfo(
+			.semaphore = c->rendered,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		),
+	);
+	auto get = xVkSemaphoreGetFdInfoKHR(
 		.semaphore = c->rendered,
 		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-	};
+	);
 	int fence;
 
 	assert(buffer->width == swapchain->width && buffer->height == swapchain->height);

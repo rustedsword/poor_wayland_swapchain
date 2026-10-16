@@ -14,9 +14,12 @@ Vulkan apps should set `NODEVICE_SELECT=1`, or Mesa's device-select layer opens
 its own blocking connection with the system libwayland.
 
 It needs Linux 6.16 or newer, poor_wayland, wayland-protocols 1.49 or newer and
-libgbm, and Vulkan 1.4 for the Vulkan images. Installed poor_wayland and
-wayland-protocols are used if there are, the submodules otherwise:
-`--force-fallback-for=poor_wayland,wayland-protocols` forces them.
+libgbm, and Vulkan 1.4 and
+[vulkan_initializers](https://github.com/rustedsword/vulkan_initializers) for the
+Vulkan images. Installed poor_wayland, wayland-protocols and vulkan_initializers
+are used if there are, the submodules otherwise:
+`--force-fallback-for=poor_wayland,wayland-protocols,vulkan_initializers` forces
+them.
 
 [examples/simple-shm.c](examples/simple-shm.c),
 [examples/simple-egl.c](examples/simple-egl.c), which draws with OpenGL ES

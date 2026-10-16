@@ -33,9 +33,12 @@ endforeach
 vulkan_dep = dependency('vulkan', required: false)
 swapchain_sources = client_protocol_h + protocol_c + [ 'swapchain.c', 'swapchain-gbm.c' ]
 swapchain_deps = [ client_dep, gbm_dep, poor_loop_dep ]
+private_deps = []
 if vulkan_dep.found()
+	vulkan_initializers_dep = dependency('vulkan_initializers', fallback: 'vulkan_initializers')
 	swapchain_sources += 'swapchain-vulkan.c'
 	swapchain_deps += vulkan_dep.partial_dependency(compile_args: true, includes: true)
+	private_deps += vulkan_initializers_dep
 endif
 
 swapchain = library(
@@ -43,7 +46,7 @@ swapchain = library(
 	sources: swapchain_sources,
 	version: meson.project_version(),
 	soversion: '0',
-	dependencies: swapchain_deps,
+	dependencies: swapchain_deps + private_deps,
 	install: true
 )
 

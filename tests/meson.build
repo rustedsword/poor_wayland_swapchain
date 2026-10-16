@@ -66,7 +66,7 @@ if vulkan_dep.found()
 	vulkan_test = executable(
 		'vulkan-test',
 		[ 'vulkan-test.c', 'swapchain-server.c' ] + server_protocol_h,
-		dependencies: [ test_runner_dep, client_dep, server_dep, swapchain_dep, vulkan_dep ],
+		dependencies: [ test_runner_dep, client_dep, server_dep, swapchain_dep, vulkan_dep, vulkan_initializers_dep ],
 	)
 	foreach ring : [ 'default', 'coop', 'defer', 'sqpoll' ]
 		test(

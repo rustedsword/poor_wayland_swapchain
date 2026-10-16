@@ -7,3 +7,6 @@
 [submodule "refs/Vulkan-Docs"]
 	path = refs/Vulkan-Docs
 	url = https://github.com/KhronosGroup/Vulkan-Docs
+[submodule "subprojects/vulkan_initializers"]
+	path = subprojects/vulkan_initializers
+	url = https://github.com/rustedsword/vulkan_initializers.git
