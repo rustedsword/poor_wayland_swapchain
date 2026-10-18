@@ -6,3 +6,4 @@
 6. Do not use dynamic memory allocation, user should be in control of memory management.
 7. No synchronous operations: all I/O goes through the loop, closing fds included. The only exceptions are calls io_uring cannot do, like sigprocmask() or signalfd(), and reporting that the loop itself failed.
 8. All requests on an fd should be completed before its close can begin. poor_loop groups and fd groups (poor_loop_group.h, poor_loop_fd.h) were made for this case.
+9. Functions which call callbacks should call them only synchronously or only asynchronously. The only exception is allocator callbacks.
