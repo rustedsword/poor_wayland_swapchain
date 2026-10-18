@@ -337,8 +337,9 @@ static int draw_fence(struct app *app)
 }
 
 /* Each frame asks for the next one. The pattern repeats every 512 steps of time, which keeps floats small. */
-static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t time)
+static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t time)
 {
+	struct poor_wl_swapchain_buffer *buffer = poor_wl_swapchain_acquire(swapchain);
 	struct app *app = app_of_swapchain(swapchain);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, target_of(app, buffer)->framebuffer);

@@ -30,12 +30,21 @@ static struct poor_wl_swapchain *swapchain_of(poor_wl_swapchain_io *io)
 	return container_of(io, struct poor_wl_swapchain, io);
 }
 
+/* Callbacks that a call of the caller leads to come from the loop, never from inside that call */
+static void swapchain_kick(struct poor_wl_swapchain *swapchain)
+{
+	if (!poor_loop_timer_armed(&swapchain->timer))
+		poor_loop_group_timer_arm(swapchain->loop, &swapchain->io, &swapchain->timer, 0);
+}
+
 static void swapchain_fail(struct poor_wl_swapchain *swapchain, int error)
 {
+	assert(error > 0);
 	if (swapchain->failed)
 		return;
 	swapchain->failed = true;
-	swapchain->error_fn(swapchain, error);
+	swapchain->error = error;
+	swapchain_kick(swapchain);
 }
 
 static int drm_ioctl(int fd, unsigned long request, void *arg)
@@ -234,6 +243,15 @@ POOR_LOOP_GROUP_OP(swapchain_on_release, loop, io, op, cqe)
 
 POOR_LOOP_GROUP_TIMER(swapchain_on_timer, loop, io, timer)
 {
+	struct poor_wl_swapchain *swapchain = swapchain_of(io);
+	int error = swapchain->error;
+
+	if (!error) {
+		swapchain_render(swapchain);
+		return;
+	}
+	swapchain->error = 0;
+	swapchain->error_fn(swapchain, error);
 }
 
 POOR_LOOP_GROUP_DONE(poor_wl_swapchain_io, loop, io)
@@ -330,20 +348,21 @@ static struct poor_wl_swapchain_buffer *swapchain_free_buffer(struct poor_wl_swa
 	return unallocated;
 }
 
-/*
- * The caller renders once the compositor wants a frame and a buffer is free, after the feedback came. With explicit
- * synchronization the release points are checked only before a new buffer would be needed, and waited for if none
- * has signaled yet.
- */
-static void swapchain_render(struct poor_wl_swapchain *swapchain)
+static bool swapchain_can_start(const struct poor_wl_swapchain *swapchain)
 {
-	struct poor_wl_swapchain_buffer *buffer;
+	return !swapchain->frame_pending && !swapchain->rendering && !swapchain->failed && swapchain->tranche_count &&
+	       swapchain->allocator && swapchain->width && swapchain->height;
+}
+
+/*
+ * With explicit synchronization the release points are checked only before a new buffer would be needed, and waited
+ * for if none has signaled yet.
+ */
+static struct poor_wl_swapchain_buffer *swapchain_next_buffer(struct poor_wl_swapchain *swapchain)
+{
+	struct poor_wl_swapchain_buffer *buffer = swapchain_free_buffer(swapchain);
 	int ret;
 
-	if (!swapchain->frame_wanted || swapchain->frame_pending || swapchain->rendering || swapchain->failed ||
-	    !swapchain->tranche_count || !swapchain->allocator || !swapchain->width || !swapchain->height)
-		return;
-	buffer = swapchain_free_buffer(swapchain);
 	if (swapchain->syncobj_manager && (!buffer || !buffer->allocated)) {
 		swapchain_check_releases(swapchain);
 		buffer = swapchain_free_buffer(swapchain);
@@ -351,15 +370,27 @@ static void swapchain_render(struct poor_wl_swapchain *swapchain)
 			swapchain_wait_releases(swapchain);
 	}
 	if (!buffer || swapchain->failed)
-		return;
+		return nullptr;
 	if (!buffer->allocated && (ret = buffer_allocate(swapchain, buffer)) < 0) {
 		swapchain_fail(swapchain, -ret);
-		return;
+		return nullptr;
 	}
-	buffer->age = buffer->presented ? swapchain->presents - buffer->presented + 1 : 0;
+	return buffer;
+}
+
+/* The buffer is allocated before 'frame', which then gets it from poor_wl_swapchain_acquire() */
+static void swapchain_render(struct poor_wl_swapchain *swapchain)
+{
+	if (!swapchain->frame_wanted || !swapchain_can_start(swapchain) || !swapchain_next_buffer(swapchain))
+		return;
 	swapchain->frame_wanted = false;
-	swapchain->rendering = buffer;
-	swapchain->frame_fn(swapchain, buffer, swapchain->time);
+	swapchain->frame_fn(swapchain, swapchain->time);
+}
+
+static void swapchain_render_later(struct poor_wl_swapchain *swapchain)
+{
+	if (swapchain->frame_wanted && swapchain_can_start(swapchain))
+		swapchain_kick(swapchain);
 }
 
 static void frame_done(void *data, struct poor_wl_callback *callback, uint32_t time)
@@ -563,6 +594,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapch
 	tranche_reset(swapchain);
 	swapchain->main_device = swapchain->device = 0;
 	swapchain->time = 0;
+	swapchain->error = 0;
 	swapchain->width = swapchain->height = 0;
 	swapchain->has_main_device = swapchain->has_device = false;
 	swapchain->frame_pending = swapchain->frame_wanted = swapchain->failed = false;
@@ -603,7 +635,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_set_allocator(struct poor_wl_swapchain *sw
 	swapchain_drop_buffers(swapchain);
 	swapchain->allocator = allocator;
 	swapchain->allocator_data = data;
-	swapchain_render(swapchain);
+	swapchain_render_later(swapchain);
 }
 
 POOR_WL_EXPORT void poor_wl_swapchain_resize(struct poor_wl_swapchain *swapchain, int32_t width, int32_t height)
@@ -614,13 +646,27 @@ POOR_WL_EXPORT void poor_wl_swapchain_resize(struct poor_wl_swapchain *swapchain
 	swapchain->width = width;
 	swapchain->height = height;
 	swapchain_drop_buffers(swapchain);
-	swapchain_render(swapchain);
+	swapchain_render_later(swapchain);
 }
 
 POOR_WL_EXPORT void poor_wl_swapchain_request_frame(struct poor_wl_swapchain *swapchain)
 {
 	swapchain->frame_wanted = true;
-	swapchain_render(swapchain);
+	swapchain_render_later(swapchain);
+}
+
+POOR_WL_EXPORT struct poor_wl_swapchain_buffer *poor_wl_swapchain_acquire(struct poor_wl_swapchain *swapchain)
+{
+	struct poor_wl_swapchain_buffer *buffer;
+
+	if (!swapchain_can_start(swapchain))
+		return nullptr;
+	buffer = swapchain_next_buffer(swapchain);
+	if (!buffer)
+		return nullptr;
+	buffer->age = buffer->presented ? swapchain->presents - buffer->presented + 1 : 0;
+	swapchain->rendering = buffer;
+	return buffer;
 }
 
 POOR_WL_EXPORT void poor_wl_swapchain_present_damage_impl(struct poor_wl_swapchain *swapchain,
@@ -664,12 +710,13 @@ POOR_WL_EXPORT void poor_wl_swapchain_present(struct poor_wl_swapchain *swapchai
 }
 
 /*
- * A destroyed swapchain doesn't render anymore, if it is destroyed from one of its callbacks. The timer keeps 'done'
- * out of this call.
+ * A destroyed swapchain neither renders nor reports errors anymore, e.g. when it is destroyed from a callback. The
+ * timer keeps 'done' out of this call.
  */
 POOR_WL_EXPORT void poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchain, poor_wl_swapchain_done_fn *done)
 {
 	swapchain->failed = true;
+	swapchain->error = 0;
 	swapchain->done_fn = done;
 	foreach_array_ref(swapchain->buffers, buffer)
 		if (buffer->allocated)
@@ -682,7 +729,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchai
 	if (swapchain->table)
 		munmap(swapchain->table, swapchain->table_size);
 	cancel_op(swapchain->loop, &swapchain->release_op);
-	poor_loop_group_timer_arm(swapchain->loop, &swapchain->io, &swapchain->timer, 0);
+	swapchain_kick(swapchain);
 	if (poor_loop_group_release(&swapchain->io))
 		poor_loop_group_call_done(poor_wl_swapchain_io, swapchain->loop, &swapchain->io);
 }

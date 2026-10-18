@@ -459,7 +459,7 @@ static void image_barrier(VkCommandBuffer commands, const VkImageMemoryBarrier2 
  * compositor was done with the buffer, and so was the last batch that drew it, which Vulkan learns from the fence of
  * that batch.
  */
-static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t time)
+static void draw(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t time)
 {
 	struct app *app = app_of_swapchain(swapchain);
 	struct target *target = target_of(app, buffer);
@@ -523,8 +523,6 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	);
 	int fence;
 
-	if (app->closing)
-		return;
 	if (!full) {
 		foreach_array_const_ref(damage.rects, rect)
 			count += clear_rect(rect, buffer->width, buffer->height, &clears[count]);
@@ -565,6 +563,12 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_
 	app->presented_width = buffer->width;
 	app->presented_height = buffer->height;
 	poor_wl_swapchain_request_frame(swapchain);
+}
+
+static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t time)
+{
+	if (!app_of_swapchain(swapchain)->closing)
+		draw(swapchain, poor_wl_swapchain_acquire(swapchain), time);
 }
 
 static void swapchain_error(struct poor_wl_swapchain *swapchain, int error)

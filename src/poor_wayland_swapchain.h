@@ -21,6 +21,7 @@ extern "C" {
  * buffers from an allocator in the formats and modifiers that the compositor prefers, and tells when to render
  * the next frame. Rendering is up to the caller, e.g. with EGL on the GBM device that poor_wl_gbm opens for the
  * device of the feedback. Renderers without implicit synchronization, like Vulkan, need explicit synchronization.
+ * Callbacks come from the loop, never from inside a call of the library, except the ones of allocators.
  */
 
 constexpr unsigned POOR_WL_SWAPCHAIN_BUFFERS = 3;
@@ -46,7 +47,7 @@ struct poor_wl_swapchain_rect {
 
 /*
  * The allocator fills 'data', 'modifier', 'planes' and 'plane_count'. The swapchain takes the fds of the planes and
- * sets 'format', the one of its formats that the buffer was allocated in. 'age' is set before the frame function: the
+ * sets 'format', the one of its formats that the buffer was allocated in. poor_wl_swapchain_acquire() sets 'age': the
  * buffer holds the frame presented 'age' frames ago, 1 being the last one, or undefined contents if it is 0.
  */
 struct poor_wl_swapchain_buffer {
@@ -87,9 +88,11 @@ struct poor_wl_swapchain_tranche {
 
 /* The buffers have to come from 'device', which is set again if it changes */
 typedef void poor_wl_swapchain_device_fn(struct poor_wl_swapchain *swapchain, dev_t device);
-/* Render into 'buffer' and present it. 'time' is the one of the frame callback, in milliseconds. */
-typedef void poor_wl_swapchain_frame_fn(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer,
-					uint32_t time);
+/*
+ * Draw a frame if there is something new to show: take its buffer with poor_wl_swapchain_acquire() and present it.
+ * 'time' is the one of the frame callback, in milliseconds.
+ */
+typedef void poor_wl_swapchain_frame_fn(struct poor_wl_swapchain *swapchain, uint32_t time);
 /* The swapchain can't go on, e.g. the compositor takes no buffers of the format */
 typedef void poor_wl_swapchain_error_fn(struct poor_wl_swapchain *swapchain, int error);
 typedef void poor_wl_swapchain_done_fn(struct poor_wl_swapchain *swapchain);
@@ -126,7 +129,7 @@ struct poor_wl_swapchain {
 	dev_t main_device, device;
 	uint32_t formats[POOR_WL_SWAPCHAIN_FORMATS];
 	uint32_t time;
-	int drm_fd, eventfd;
+	int drm_fd, eventfd, error;
 	int32_t width, height;
 	bool has_main_device, has_device, frame_pending, frame_wanted, failed;
 };
@@ -164,13 +167,23 @@ poor_wl_swapchain_set_allocator(struct poor_wl_swapchain *swapchain, const struc
 void
 poor_wl_swapchain_resize(struct poor_wl_swapchain *swapchain, int32_t width, int32_t height);
 
-/* Ask for a call of 'frame': right away if possible, else after the frame callback or a release of a buffer */
+/*
+ * Ask for a call of 'frame' once a frame can start: after the frame callback or a release of a buffer, or on the next
+ * run of the loop if one already can.
+ */
 void
 poor_wl_swapchain_request_frame(struct poor_wl_swapchain *swapchain);
 
 /*
- * Attach, damage and commit the buffer that 'frame' got, with a frame callback. 'fence' is a sync_file that signals
- * once the buffer is rendered, or -1 if it already is, and the swapchain closes it. Fences need explicit
+ * The buffer of a new frame to draw into and present, or NULL if none can start yet, e.g. before the frame callback of
+ * the last one. 'frame' always gets one, unless it changed the swapchain before.
+ */
+struct poor_wl_swapchain_buffer *
+poor_wl_swapchain_acquire(struct poor_wl_swapchain *swapchain);
+
+/*
+ * Attach, damage and commit the buffer of poor_wl_swapchain_acquire(), with a frame callback. 'fence' is a sync_file
+ * that signals once the buffer is rendered, or -1 if it already is, and the swapchain closes it. Fences need explicit
  * synchronization. Other state of the commit, like a viewport or presentation feedback, goes in before this call.
  */
 void

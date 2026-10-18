@@ -237,8 +237,9 @@ static void image_barrier(VkCommandBuffer commands, const VkImageMemoryBarrier2 
  * contents and only gets a dot redrawn, as in simple-vulkan. The image goes to the compositor with the fence of the
  * batch. A buffer comes back after its last drawing, which Vulkan learns from the fence of that batch.
  */
-static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t)
+static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t)
 {
+	struct poor_wl_swapchain_buffer *buffer = poor_wl_swapchain_acquire(swapchain);
 	struct client *c = client_of(swapchain);
 	struct target *target = target_of(c, buffer);
 	VkImage image = ((struct poor_wl_vulkan_image *)buffer->data)->image;

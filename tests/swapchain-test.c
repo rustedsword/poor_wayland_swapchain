@@ -33,11 +33,11 @@ struct client {
 	struct poor_wl_surface surface;
 	struct poor_wl_swapchain swapchain;
 	dev_t device;
-	unsigned devices, frames, max_frames, allocations, frees;
+	unsigned devices, frames, drawn, idle, max_frames, allocations, frees, swapchain_dones;
 	uint64_t ages[32];
 	uint32_t format, fail_format;
 	int swapchain_error, fence_fd;
-	bool synced, done, error_called, fail_scanout, have_syncobj, swapchain_done, partial;
+	bool synced, done, error_called, fail_scanout, have_syncobj, partial, idle_resize;
 	char in[16384];
 	char out[16384];
 	union poor_wl_map_entry objects[64];
@@ -137,13 +137,25 @@ static const uint32_t argb_or_xrgb[] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB888
 
 static const struct poor_wl_swapchain_rect partial_damage[] = { { 1, 2, 3, 4 }, { 5, 6, 7, 8 } };
 
-static void swapchain_frame(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_buffer *buffer, uint32_t)
+static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t)
 {
 	struct client *c = client_of(swapchain);
-	int fence = c->fence_fd >= 0 ? signaled_fence(c->fence_fd) : -1;
+	struct poor_wl_swapchain_buffer *buffer;
+	int fence;
 
-	assert(buffer->width == swapchain->width && buffer->height == swapchain->height && c->frames < ARRAY_SIZE(c->ages));
-	c->ages[c->frames++] = buffer->age;
+	c->frames++;
+	if (c->idle) {
+		c->idle--;
+		if (c->idle_resize)
+			poor_wl_swapchain_resize(swapchain, 2 * swapchain->width, swapchain->height);
+		if (c->frames < c->max_frames)
+			poor_wl_swapchain_request_frame(swapchain);
+		return;
+	}
+	buffer = poor_wl_swapchain_acquire(swapchain);
+	fence = c->fence_fd >= 0 ? signaled_fence(c->fence_fd) : -1;
+	assert(buffer->width == swapchain->width && buffer->height == swapchain->height && c->drawn < ARRAY_SIZE(c->ages));
+	c->ages[c->drawn++] = buffer->age;
 	c->format = buffer->format;
 	if (c->partial)
 		poor_wl_swapchain_present_damage(swapchain, buffer, fence, partial_damage);
@@ -160,7 +172,7 @@ static void swapchain_error(struct poor_wl_swapchain *swapchain, int error)
 
 static void swapchain_done(struct poor_wl_swapchain *swapchain)
 {
-	client_of(swapchain)->swapchain_done = true;
+	client_of(swapchain)->swapchain_dones++;
 }
 
 static void registry_global(void *data, struct poor_wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
@@ -220,11 +232,12 @@ static void client_start_impl(struct client *c, struct poor_loop *loop, size_t c
 	struct poor_wl_connection_memory memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);
 
 	c->loop = loop;
-	c->devices = c->frames = c->max_frames = c->allocations = c->frees = 0;
+	c->devices = c->frames = c->drawn = c->idle = c->max_frames = c->allocations = c->frees = c->swapchain_dones = 0;
 	c->swapchain_error = 0;
 	c->fail_format = 0;
 	c->fence_fd = -1;
-	c->synced = c->done = c->error_called = c->fail_scanout = c->have_syncobj = c->swapchain_done = c->partial = false;
+	c->synced = c->done = c->error_called = c->fail_scanout = c->have_syncobj = c->partial = false;
+	c->idle_resize = false;
 	poor_wl_display_connect_to_fd(&c->display, loop, &memory, swapchain_server_connect(), client_error, client_done);
 	poor_wl_display_get_registry(&c->display, &c->registry);
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
@@ -242,10 +255,11 @@ static void client_stop(struct client *c)
 	poor_wl_swapchain_destroy(&c->swapchain, swapchain_done);
 	poor_wl_surface_destroy(&c->surface);
 	client_roundtrip(c);
-	run_until(c->loop, c->swapchain_done);
+	run_until(c->loop, c->swapchain_dones);
 	assert(c->frees == c->allocations && swapchain_server.buffers_destroyed == swapchain_server.buffers_created);
 	poor_wl_display_disconnect(&c->display);
 	run_until(c->loop, c->done);
+	assert(c->swapchain_dones == 1);
 }
 
 static void client_present(struct client *c, int32_t width, int32_t height, unsigned frames)
@@ -342,6 +356,158 @@ TEST(buffers_know_their_age)
 	client_present(&c, 32, 16, 3);
 	assert(c.frames == ARRAY_SIZE(ages) && !memcmp(c.ages, ages, ARRAY_SIZE_BYTES(ages)));
 	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(frames_may_draw_nothing)
+{
+	static const uint64_t ages[] = { 0, 0, 2 };
+	struct poor_loop loop;
+	unsigned commits;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 2);
+	client_roundtrip(&c);
+	commits = swapchain_server.commits;
+	c.idle = 2;
+	c.max_frames = c.frames + 3;
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	run_until(&loop, c.frames == c.max_frames);
+	client_roundtrip(&c);
+	assert(swapchain_server.commits == commits + 1 && c.allocations == 2);
+	assert(c.drawn == ARRAY_SIZE(ages) && !memcmp(c.ages, ages, ARRAY_SIZE_BYTES(ages)));
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(frames_that_draw_nothing_free_replaced_buffers)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	client_present(&c, 16, 16, 2);
+	client_roundtrip(&c);
+	c.idle = 1;
+	c.idle_resize = true;
+	c.max_frames = c.frames + 2;
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	run_until(&loop, c.frames == c.max_frames);
+	client_roundtrip(&c);
+	assert(swapchain_server.width == 32 && c.allocations == 3 && c.frees == 2);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(frames_come_from_loop)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	c.max_frames = 1;
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	poor_wl_swapchain_resize(&c.swapchain, 16, 16);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	assert(!c.frames);
+	run_until(&loop, c.frames == 1);
+	client_roundtrip(&c);
+	c.max_frames = 2;
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	poor_wl_swapchain_resize(&c.swapchain, 32, 16);
+	assert(c.frames == 1);
+	run_until(&loop, c.frames == 2);
+	client_roundtrip(&c);
+	assert(c.frames == 2 && swapchain_server.width == 32);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(acquire_starts_frames_right_away)
+{
+	struct poor_wl_swapchain_buffer *buffer;
+	struct poor_loop loop;
+	unsigned commits;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	assert(!poor_wl_swapchain_acquire(&c.swapchain));
+	poor_wl_swapchain_resize(&c.swapchain, 16, 16);
+	commits = swapchain_server.commits;
+	buffer = poor_wl_swapchain_acquire(&c.swapchain);
+	assert(buffer && buffer->width == 16 && !buffer->age && !poor_wl_swapchain_acquire(&c.swapchain));
+	poor_wl_swapchain_present(&c.swapchain, buffer, -1);
+	assert(!poor_wl_swapchain_acquire(&c.swapchain));
+	client_roundtrip(&c);
+	assert(swapchain_server.commits == commits + 1 && !c.frames);
+	buffer = poor_wl_swapchain_acquire(&c.swapchain);
+	assert(buffer && !buffer->age);
+	poor_wl_swapchain_present(&c.swapchain, buffer, -1);
+	c.max_frames = 1;
+	poor_wl_swapchain_request_frame(&c.swapchain);
+	run_until(&loop, c.frames == 1);
+	client_roundtrip(&c);
+	assert(swapchain_server.commits == commits + 3 && c.ages[0] == 2 && c.allocations == 2);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(errors_come_from_loop)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	c.fail_format = DRM_FORMAT_XRGB8888;
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	poor_wl_swapchain_resize(&c.swapchain, 16, 16);
+	assert(!poor_wl_swapchain_acquire(&c.swapchain) && !c.swapchain_error);
+	run_until(&loop, c.swapchain_error);
+	assert(c.swapchain_error == ENOTSUP && !c.allocations);
+	client_stop(&c);
+	server_stop(&loop);
+	loop_fini(&loop);
+}
+
+TEST(destroy_drops_pending_error)
+{
+	struct poor_loop loop;
+	struct client c;
+
+	loop_init(&loop);
+	server_config(4);
+	swapchain_server_start(&loop);
+	client_start(&c, &loop, xrgb8888);
+	c.fail_format = DRM_FORMAT_XRGB8888;
+	poor_wl_swapchain_set_allocator(&c.swapchain, &memfd_allocator, &c);
+	poor_wl_swapchain_resize(&c.swapchain, 16, 16);
+	assert(!poor_wl_swapchain_acquire(&c.swapchain));
+	client_stop(&c);
+	assert(!c.swapchain_error);
 	server_stop(&loop);
 	loop_fini(&loop);
 }
