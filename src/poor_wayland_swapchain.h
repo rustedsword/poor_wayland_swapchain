@@ -86,16 +86,19 @@ struct poor_wl_swapchain_tranche {
 	uint64_t modifiers[POOR_WL_SWAPCHAIN_FORMATS][POOR_WL_SWAPCHAIN_MODIFIERS];
 };
 
-/* The buffers have to come from 'device', which is set again if it changes */
-typedef void poor_wl_swapchain_device_fn(struct poor_wl_swapchain *swapchain, dev_t device);
-/*
- * Draw a frame if there is something new to show: take its buffer with poor_wl_swapchain_acquire() and present it.
- * 'time' is the one of the frame callback, in milliseconds.
- */
-typedef void poor_wl_swapchain_frame_fn(struct poor_wl_swapchain *swapchain, uint32_t time);
-/* The swapchain can't go on, e.g. the compositor takes no buffers of the format */
-typedef void poor_wl_swapchain_error_fn(struct poor_wl_swapchain *swapchain, int error);
-typedef void poor_wl_swapchain_done_fn(struct poor_wl_swapchain *swapchain);
+struct poor_wl_swapchain_listener {
+	/* The buffers have to come from 'device', which is set again if it changes */
+	void (*device)(struct poor_wl_swapchain *swapchain, dev_t device);
+	/*
+	 * Draw a frame if there is something new to show: take its buffer with poor_wl_swapchain_acquire() and
+	 * present it. 'time' is the one of the frame callback, in milliseconds.
+	 */
+	void (*frame)(struct poor_wl_swapchain *swapchain, uint32_t time);
+	/* The swapchain can't go on, e.g. the compositor takes no buffers of the format */
+	void (*error)(struct poor_wl_swapchain *swapchain, int error);
+	/* The memory of the swapchain can go, after poor_wl_swapchain_destroy() */
+	void (*done)(struct poor_wl_swapchain *swapchain);
+};
 
 poor_loop_group_declare(poor_wl_swapchain_io);
 
@@ -119,10 +122,7 @@ struct poor_wl_swapchain {
 	unsigned tranche_count, pending_count, format_count;
 	const struct poor_wl_swapchain_allocator *allocator;
 	void *allocator_data;
-	poor_wl_swapchain_device_fn *device_fn;
-	poor_wl_swapchain_frame_fn *frame_fn;
-	poor_wl_swapchain_error_fn *error_fn;
-	poor_wl_swapchain_done_fn *done_fn;
+	const struct poor_wl_swapchain_listener *listener;
 	void *table;
 	size_t table_size;
 	uint64_t released, presents;
@@ -137,17 +137,15 @@ struct poor_wl_swapchain {
 /*
  * Present buffers on 'surface' in the first of 'formats' that the compositor takes and the allocator manages.
  * 'formats' is an array of up to POOR_WL_SWAPCHAIN_FORMATS DRM formats in order of preference, or a pointer to one.
- * 'dmabuf' has at least version 4. 'device' tells where to allocate, buffers come once
- * poor_wl_swapchain_set_allocator() was called.
+ * 'dmabuf' has at least version 4. 'listener' stays until its 'done', and its 'device' tells where to allocate.
+ * Buffers come once poor_wl_swapchain_set_allocator() was called.
  */
 void
 poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
 			    struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface, size_t count,
-			    const uint32_t (*formats)[count], poor_wl_swapchain_device_fn *device,
-			    poor_wl_swapchain_frame_fn *frame, poor_wl_swapchain_error_fn *error);
-#define poor_wl_swapchain_init(swapchain, loop, dmabuf, surface, formats, device, frame, error) \
-	poor_wl_swapchain_init_impl(swapchain, loop, dmabuf, surface, ARRAY_SIZE(formats), &auto_arr(formats), device, \
-				    frame, error)
+			    const uint32_t (*formats)[count], const struct poor_wl_swapchain_listener *listener);
+#define poor_wl_swapchain_init(swapchain, loop, dmabuf, surface, formats, listener) \
+	poor_wl_swapchain_init_impl(swapchain, loop, dmabuf, surface, ARRAY_SIZE(formats), &auto_arr(formats), listener)
 
 /*
  * Synchronize explicitly through 'manager': the compositor waits for the fences of poor_wl_swapchain_present(), and
@@ -199,9 +197,9 @@ poor_wl_swapchain_present_damage_impl(struct poor_wl_swapchain *swapchain, struc
 #define poor_wl_swapchain_present_damage(swapchain, buffer, fence, damage) \
 	poor_wl_swapchain_present_damage_impl(swapchain, buffer, fence, ARRAY_SIZE(damage), &auto_arr(damage))
 
-/* Free all buffers, before the device of the allocator goes away. 'done' is called once the swapchain's memory can go. */
+/* Free all buffers, before the device of the allocator goes away. 'done' of the listener comes afterwards. */
 void
-poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchain, poor_wl_swapchain_done_fn *done);
+poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchain);
 
 poor_loop_group_declare(poor_wl_gbm_io);
 

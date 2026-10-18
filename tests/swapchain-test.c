@@ -175,6 +175,13 @@ static void swapchain_done(struct poor_wl_swapchain *swapchain)
 	client_of(swapchain)->swapchain_dones++;
 }
 
+static const struct poor_wl_swapchain_listener swapchain_listener = {
+	.device = swapchain_device,
+	.frame = swapchain_frame,
+	.error = swapchain_error,
+	.done = swapchain_done,
+};
+
 static void registry_global(void *data, struct poor_wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
 {
 	struct client *c = data;
@@ -243,8 +250,7 @@ static void client_start_impl(struct client *c, struct poor_loop *loop, size_t c
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
 	client_roundtrip(c);
 	poor_wl_compositor_create_surface(&c->compositor, &c->surface);
-	poor_wl_swapchain_init(&c->swapchain, loop, &c->dmabuf, &c->surface, formats, swapchain_device, swapchain_frame,
-			       swapchain_error);
+	poor_wl_swapchain_init(&c->swapchain, loop, &c->dmabuf, &c->surface, formats, &swapchain_listener);
 	client_roundtrip(c);
 }
 
@@ -252,7 +258,7 @@ static void client_start_impl(struct client *c, struct poor_loop *loop, size_t c
 
 static void client_stop(struct client *c)
 {
-	poor_wl_swapchain_destroy(&c->swapchain, swapchain_done);
+	poor_wl_swapchain_destroy(&c->swapchain);
 	poor_wl_surface_destroy(&c->surface);
 	client_roundtrip(c);
 	run_until(c->loop, c->swapchain_dones);

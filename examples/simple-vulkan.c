@@ -124,7 +124,7 @@ static void swapchain_done(struct poor_wl_swapchain *swapchain)
 static void app_teardown(struct app *app)
 {
 	if (app->swapchain_started)
-		poor_wl_swapchain_destroy(&app->swapchain, swapchain_done);
+		poor_wl_swapchain_destroy(&app->swapchain);
 	if (app->device) {
 		vkDestroyFence(app->device, app->drained, nullptr);
 		vkDestroySemaphore(app->device, app->idle, nullptr);
@@ -577,6 +577,13 @@ static void swapchain_error(struct poor_wl_swapchain *swapchain, int error)
 	app_quit(app_of_swapchain(swapchain), 1);
 }
 
+static const struct poor_wl_swapchain_listener swapchain_listener = {
+	.device = swapchain_device,
+	.frame = swapchain_frame,
+	.error = swapchain_error,
+	.done = swapchain_done,
+};
+
 static void shell_surface_configure(void *data, struct poor_xdg_surface *shell_surface, uint32_t serial)
 {
 	struct app *app = data;
@@ -664,8 +671,7 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 	poor_xdg_toplevel_add_listener(&app->toplevel, &toplevel_listener, app);
 	poor_xdg_toplevel_set_title(&app->toplevel, "poor_wayland");
 	poor_xdg_toplevel_set_app_id(&app->toplevel, "poor_wayland.simple-vulkan");
-	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, formats, swapchain_device,
-			       swapchain_frame, swapchain_error);
+	poor_wl_swapchain_init(&app->swapchain, &app->loop, &app->dmabuf, &app->surface, formats, &swapchain_listener);
 	app->swapchain_started = true;
 	poor_wl_surface_commit(&app->surface);
 }

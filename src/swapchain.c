@@ -251,7 +251,7 @@ POOR_LOOP_GROUP_TIMER(swapchain_on_timer, loop, io, timer)
 		return;
 	}
 	swapchain->error = 0;
-	swapchain->error_fn(swapchain, error);
+	swapchain->listener->error(swapchain, error);
 }
 
 POOR_LOOP_GROUP_DONE(poor_wl_swapchain_io, loop, io)
@@ -260,7 +260,7 @@ POOR_LOOP_GROUP_DONE(poor_wl_swapchain_io, loop, io)
 
 	if (swapchain->eventfd >= 0)
 		poor_loop_close_fd_or_submit(loop, swapchain->eventfd, 0);
-	swapchain->done_fn(swapchain);
+	swapchain->listener->done(swapchain);
 }
 
 static const struct poor_wl_buffer_listener buffer_listener = {
@@ -384,7 +384,7 @@ static void swapchain_render(struct poor_wl_swapchain *swapchain)
 	if (!swapchain->frame_wanted || !swapchain_can_start(swapchain) || !swapchain_next_buffer(swapchain))
 		return;
 	swapchain->frame_wanted = false;
-	swapchain->frame_fn(swapchain, swapchain->time);
+	swapchain->listener->frame(swapchain, swapchain->time);
 }
 
 static void swapchain_render_later(struct poor_wl_swapchain *swapchain)
@@ -461,7 +461,7 @@ static void feedback_done(void *data, struct poor_zwp_linux_dmabuf_feedback_v1 *
 	if (!swapchain->has_device || device != swapchain->device) {
 		swapchain->has_device = true;
 		swapchain->device = device;
-		swapchain->device_fn(swapchain, device);
+		swapchain->listener->device(swapchain, device);
 	}
 	swapchain_render(swapchain);
 }
@@ -565,8 +565,7 @@ static const struct poor_zwp_linux_dmabuf_feedback_v1_listener feedback_listener
 POOR_WL_EXPORT void poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapchain, struct poor_loop *loop,
 						struct poor_zwp_linux_dmabuf_v1 *dmabuf, struct poor_wl_surface *surface,
 						size_t count, const uint32_t (*formats)[count],
-						poor_wl_swapchain_device_fn *device, poor_wl_swapchain_frame_fn *frame,
-						poor_wl_swapchain_error_fn *error)
+						const struct poor_wl_swapchain_listener *listener)
 {
 	assert(poor_zwp_linux_dmabuf_v1_get_version(dmabuf) >= POOR_ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK_SINCE_VERSION);
 	assert(count && count <= ARRAY_SIZE(swapchain->formats));
@@ -581,9 +580,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_init_impl(struct poor_wl_swapchain *swapch
 	swapchain->surface = surface;
 	copy_array(swapchain->formats, formats);
 	swapchain->format_count = count;
-	swapchain->device_fn = device;
-	swapchain->frame_fn = frame;
-	swapchain->error_fn = error;
+	swapchain->listener = listener;
 	swapchain->allocator = nullptr;
 	swapchain->allocator_data = nullptr;
 	swapchain->rendering = nullptr;
@@ -713,11 +710,10 @@ POOR_WL_EXPORT void poor_wl_swapchain_present(struct poor_wl_swapchain *swapchai
  * A destroyed swapchain neither renders nor reports errors anymore, e.g. when it is destroyed from a callback. The
  * timer keeps 'done' out of this call.
  */
-POOR_WL_EXPORT void poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchain, poor_wl_swapchain_done_fn *done)
+POOR_WL_EXPORT void poor_wl_swapchain_destroy(struct poor_wl_swapchain *swapchain)
 {
 	swapchain->failed = true;
 	swapchain->error = 0;
-	swapchain->done_fn = done;
 	foreach_array_ref(swapchain->buffers, buffer)
 		if (buffer->allocated)
 			buffer_free(buffer);
