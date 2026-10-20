@@ -43,6 +43,7 @@ struct buffer {
 
 struct app {
 	struct poor_loop loop;
+	struct example_log log;
 	struct poor_wl_display display;
 	struct poor_wl_registry registry;
 	struct poor_wl_callback sync, frame;
@@ -221,7 +222,7 @@ static void app_start(struct app *app)
 		return;
 	if (mmap_array(app->pixels, nullptr, PROT_READ | PROT_WRITE, MAP_SHARED, app->memfd, 0) == MAP_FAILED) {
 		app->pixels = nullptr;
-		log_printf("simple-shm: mmap: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-shm: mmap: %s\n", strerror(errno));
 		app_quit(app, 1);
 		return;
 	}
@@ -269,7 +270,7 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 
 	poor_wl_callback_destroy(callback);
 	if (!app->have_compositor || !app->have_shm || !app->have_wm_base) {
-		log_printf("simple-shm: the compositor has no wl_compositor, wl_shm or xdg_wm_base\n");
+		log_printf(&app->log, "simple-shm: the compositor has no wl_compositor, wl_shm or xdg_wm_base\n");
 		app_quit(app, 1);
 		return;
 	}
@@ -290,9 +291,10 @@ static void display_error(struct poor_wl_display *display)
 
 	if (error == EPROTO) {
 		code = poor_wl_display_get_protocol_error(display, &interface, &id);
-		log_printf("simple-shm: protocol error %u on %s#%u\n", code, interface ? interface->name : "[unknown]", id);
+		log_printf(&app->log, "simple-shm: protocol error %u on %s#%u\n", code,
+			   interface ? interface->name : "[unknown]", id);
 	} else {
-		log_printf("simple-shm: connection: %s\n", strerror(error));
+		log_printf(&app->log, "simple-shm: connection: %s\n", strerror(error));
 	}
 	app_quit(app, 1);
 }
@@ -312,7 +314,7 @@ static void on_truncate(struct poor_loop *, struct poor_loop_op *op, const struc
 		return;
 	}
 	if (cqe->res < 0) {
-		log_printf("simple-shm: ftruncate: %s\n", strerror(-cqe->res));
+		log_printf(&app->log, "simple-shm: ftruncate: %s\n", strerror(-cqe->res));
 		app_quit(app, 1);
 		return;
 	}
@@ -326,7 +328,7 @@ POOR_LOOP_GROUP_OP(on_signal, loop, file, op, cqe)
 	struct app *app = container_of(file, struct app, signals);
 
 	if (cqe->res == sizeof(app->siginfo))
-		log_printf("simple-shm: %s\n", strsignal(app->siginfo.ssi_signo));
+		log_printf(&app->log, "simple-shm: %s\n", strsignal(app->siginfo.ssi_signo));
 	sigprocmask(SIG_UNBLOCK, &app->sigset, nullptr);
 	app_quit(app, 0);
 }
@@ -350,13 +352,15 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->time = 0;
 	app->synced = app->truncated = app->frame_pending = app->draw_pending = app->closing = false;
 	app->signals_closed = true;
+	poor_loop_op_init(&app->signal_op, on_signal);
+	poor_loop_op_init(&app->truncate_op, on_truncate);
 	foreach_array_ref(app->buffers, buffer) {
 		buffer->app = app;
 		buffer->width = buffer->height = 0;
 		buffer->busy = false;
 	}
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
-		log_printf("simple-shm: can't connect: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-shm: can't connect: %s\n", strerror(errno));
 		return -1;
 	}
 	poor_wl_display_get_registry(&app->display, &app->registry);
@@ -371,18 +375,16 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	fd = signalfd(-1, &app->sigset, SFD_CLOEXEC);
 	app->memfd = memfd_create("simple-shm", MFD_CLOEXEC);
 	if (fd < 0 || app->memfd < 0) {
-		log_printf("simple-shm: %s: %s\n", fd < 0 ? "signalfd" : "memfd_create", strerror(errno));
+		log_printf(&app->log, "simple-shm: %s: %s\n", fd < 0 ? "signalfd" : "memfd_create", strerror(errno));
 		if (fd >= 0)
 			poor_loop_close_fd_or_submit(&app->loop, fd, 0);
 		app_quit(app, 1);
 		return 0;
 	}
 	poor_loop_fd_init(&app->signals, fd);
-	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
 	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
 				 array_ptr(&app->siginfo), -1);
-	poor_loop_op_init(&app->truncate_op, on_truncate);
 	io_uring_prep_ftruncate(need_sqe(poor_loop_get_sqe_or_submit(&app->loop, &app->truncate_op)), app->memfd,
 				ARRAY_SIZE_BYTES(app->pixels));
 	return 0;
@@ -393,10 +395,11 @@ static int app_finish(struct app *app)
 {
 	int ret = 0;
 
-	while (!ret && (!app->signals_closed || log_pending()))
+	while (!ret && (!app->signals_closed || log_pending(&app->log)))
 		ret = poor_loop_run_once(&app->loop);
 	if (!ret)
 		ret = poor_loop_drain(&app->loop, poor_loop_now() + DRAIN_TIMEOUT_NS);
+	log_fini(&app->log);
 	if (app->pixels)
 		munmap_array(app->pixels);
 	poor_loop_exit(&app->loop);
@@ -409,8 +412,8 @@ static int app_finish(struct app *app)
 
 int main(void)
 {
-	static struct app app;
 	struct io_uring_params params = {};
+	struct app app;
 	int ret;
 
 	ret = poor_loop_init(&app.loop, 64, &params);
@@ -418,8 +421,7 @@ int main(void)
 		dprintf(STDERR_FILENO, "simple-shm: io_uring: %s\n", strerror(-ret));
 		return 1;
 	}
-	log_init(&app.loop, "simple-shm");
-	poor_wl_log_set_handler_client(log_vprintf);
+	log_init(&app.log, &app.loop);
 	if (app_init(&app) < 0) {
 		app.status = 1;
 		return app_finish(&app);

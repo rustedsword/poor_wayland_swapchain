@@ -57,6 +57,7 @@ struct target {
 
 struct app {
 	struct poor_loop loop;
+	struct example_log log;
 	struct poor_wl_display display;
 	struct poor_wl_registry registry;
 	struct poor_wl_callback sync;
@@ -102,11 +103,11 @@ struct app {
 
 poor_loop_group_attach(signal_file, struct app, signals, signal_op, on_signal);
 
-static bool check(VkResult result, const char *what)
+static bool check(struct app *app, VkResult result, const char *what)
 {
 	if (result >= 0)
 		return true;
-	log_printf("simple-vulkan: %s: %d\n", what, result);
+	log_printf(&app->log, "simple-vulkan: %s: %d\n", what, result);
 	return false;
 }
 
@@ -159,8 +160,8 @@ static int idle_fence(struct app *app)
 	);
 	int fd = -1;
 
-	if (!check(vkCreateSemaphore(app->device, &info, nullptr, &app->idle), "vkCreateSemaphore") ||
-	    !check(vkCreateFence(app->device, &xVkFenceCreateInfo(), nullptr, &app->drained), "vkCreateFence"))
+	if (!check(app, vkCreateSemaphore(app->device, &info, nullptr, &app->idle), "vkCreateSemaphore") ||
+	    !check(app, vkCreateFence(app->device, &xVkFenceCreateInfo(), nullptr, &app->drained), "vkCreateFence"))
 		return -1;
 	auto submit = xVkSubmitInfo2(
 		.signalSemaphoreInfoCount = 1,
@@ -171,9 +172,9 @@ static int idle_fence(struct app *app)
 	);
 	auto get = xVkSemaphoreGetFdInfoKHR(.semaphore = app->idle, .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
 
-	if (!check(vkQueueSubmit2(app->queue, 1, &submit, app->drained), "vkQueueSubmit2"))
+	if (!check(app, vkQueueSubmit2(app->queue, 1, &submit, app->drained), "vkQueueSubmit2"))
 		return -1;
-	check(app->get_semaphore_fd(app->device, &get, &fd), "vkGetSemaphoreFdKHR");
+	check(app, app->get_semaphore_fd(app->device, &get, &fd), "vkGetSemaphoreFdKHR");
 	return fd;
 }
 
@@ -231,9 +232,9 @@ static bool target_init(struct app *app, struct target *target, const struct poo
 	target->view = VK_NULL_HANDLE;
 	target->commands = VK_NULL_HANDLE;
 	target->done = VK_NULL_HANDLE;
-	return check(vkCreateImageView(app->device, &view_info, nullptr, &target->view), "vkCreateImageView") &&
-	       check(vkAllocateCommandBuffers(app->device, &commands_info, &target->commands), "vkAllocateCommandBuffers") &&
-	       check(vkCreateFence(app->device, &fence_info, nullptr, &target->done), "vkCreateFence");
+	return check(app, vkCreateImageView(app->device, &view_info, nullptr, &target->view), "vkCreateImageView") &&
+	       check(app, vkAllocateCommandBuffers(app->device, &commands_info, &target->commands), "vkAllocateCommandBuffers") &&
+	       check(app, vkCreateFence(app->device, &fence_info, nullptr, &target->done), "vkCreateFence");
 }
 
 /* poor_wl_vulkan allocates, the targets come and go with the buffers */
@@ -254,8 +255,8 @@ static int allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uint32_
 		return -ENOMEM;
 	}
 	if (format != app->format)
-		log_printf("simple-vulkan: buffers in %c%c%c%c\n", (char)format, (char)(format >> 8), (char)(format >> 16),
-			   (char)(format >> 24));
+		log_printf(&app->log, "simple-vulkan: buffers in %c%c%c%c\n", (char)format, (char)(format >> 8),
+			   (char)(format >> 16), (char)(format >> 24));
 	app->format = format;
 	return 0;
 }
@@ -307,7 +308,7 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 
 	/* Mesa's device-select layer would connect to the compositor with the system libwayland and block, to sort GPUs */
 	setenv("NODEVICE_SELECT", "1", 1);
-	if (!check(vkCreateInstance(&xVkInstanceCreateInfo(.pApplicationInfo = &application), nullptr, &app->instance),
+	if (!check(app, vkCreateInstance(&xVkInstanceCreateInfo(.pApplicationInfo = &application), nullptr, &app->instance),
 		   "vkCreateInstance"))
 		return false;
 	app->physical = poor_wl_vulkan_find_device(vkGetInstanceProcAddr, app->instance, device, render_minor);
@@ -316,8 +317,8 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		copy_array(app->device_name, properties.properties.deviceName);
 	}
 	if (!app->physical || !device_queue_family(app->physical, &app->family) || !device_exports_fences(app->physical)) {
-		log_printf("simple-vulkan: no Vulkan 1.4 device with dmabufs, modifiers and fences for %u:%u\n", major(device),
-			   minor(device));
+		log_printf(&app->log, "simple-vulkan: no Vulkan 1.4 device with dmabufs, modifiers and fences for %u:%u\n",
+			   major(device), minor(device));
 		return false;
 	}
 	auto device_info = xVkDeviceCreateInfo(
@@ -339,14 +340,14 @@ static bool vulkan_init(struct app *app, dev_t device, unsigned *render_minor)
 		.pNext = &xVkExportSemaphoreCreateInfo(.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT),
 	);
 
-	if (!check(vkCreateDevice(app->physical, &device_info, nullptr, &app->device), "vkCreateDevice"))
+	if (!check(app, vkCreateDevice(app->physical, &device_info, nullptr, &app->device), "vkCreateDevice"))
 		return false;
 	vkGetDeviceQueue2(app->device, &xVkDeviceQueueInfo2(.queueFamilyIndex = app->family), &app->queue);
 	app->get_semaphore_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(app->device, "vkGetSemaphoreFdKHR");
 	poor_wl_vulkan_init(&app->vulkan, &app->loop, vkGetInstanceProcAddr, app->instance, app->physical, app->device,
 			    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-	return check(vkCreateCommandPool(app->device, &pool_info, nullptr, &app->pool), "vkCreateCommandPool") &&
-	       check(vkCreateSemaphore(app->device, &semaphore_info, nullptr, &app->rendered), "vkCreateSemaphore");
+	return check(app, vkCreateCommandPool(app->device, &pool_info, nullptr, &app->pool), "vkCreateCommandPool") &&
+	       check(app, vkCreateSemaphore(app->device, &semaphore_info, nullptr, &app->rendered), "vkCreateSemaphore");
 }
 
 /* The render node only makes the timelines of explicit synchronization */
@@ -361,18 +362,18 @@ static void on_open(struct poor_loop *, struct poor_loop_op *op, const struct io
 		return;
 	}
 	if (cqe->res < 0) {
-		log_printf("simple-vulkan: %s: %s\n", app->path, strerror(-cqe->res));
+		log_printf(&app->log, "simple-vulkan: %s: %s\n", app->path, strerror(-cqe->res));
 		app_quit(app, 1);
 		return;
 	}
 	app->drm_fd = cqe->res;
 	ret = poor_wl_swapchain_set_syncobj(&app->swapchain, &app->syncobj, app->drm_fd);
 	if (ret < 0) {
-		log_printf("simple-vulkan: no explicit synchronization: %s\n", strerror(-ret));
+		log_printf(&app->log, "simple-vulkan: no explicit synchronization: %s\n", strerror(-ret));
 		app_quit(app, 1);
 		return;
 	}
-	log_printf("simple-vulkan: %s\n", app->device_name);
+	log_printf(&app->log, "simple-vulkan: %s\n", app->device_name);
 	poor_wl_swapchain_set_allocator(&app->swapchain, &allocator, app);
 }
 
@@ -382,7 +383,7 @@ static void swapchain_device(struct poor_wl_swapchain *swapchain, dev_t device)
 	unsigned render_minor;
 
 	if (app->instance) {
-		log_printf("simple-vulkan: the compositor moved to another GPU\n");
+		log_printf(&app->log, "simple-vulkan: the compositor moved to another GPU\n");
 		app_quit(app, 1);
 		return;
 	}
@@ -532,12 +533,12 @@ static void draw(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_b
 	}
 	clear_rect(&square, buffer->width, buffer->height, &square_clear);
 	if (vkGetFenceStatus(app->device, target->done) != VK_SUCCESS) {
-		log_printf("simple-vulkan: a buffer came back before its drawing was done\n");
+		log_printf(&app->log, "simple-vulkan: a buffer came back before its drawing was done\n");
 		app_quit(app, 1);
 		return;
 	}
-	if (!check(vkResetFences(app->device, 1, &target->done), "vkResetFences") ||
-	    !check(vkBeginCommandBuffer(target->commands, &begin), "vkBeginCommandBuffer")) {
+	if (!check(app, vkResetFences(app->device, 1, &target->done), "vkResetFences") ||
+	    !check(app, vkBeginCommandBuffer(target->commands, &begin), "vkBeginCommandBuffer")) {
 		app_quit(app, 1);
 		return;
 	}
@@ -548,9 +549,9 @@ static void draw(struct poor_wl_swapchain *swapchain, struct poor_wl_swapchain_b
 	vkCmdClearAttachments(target->commands, 1, &paint, 1, &square_clear);
 	vkCmdEndRendering(target->commands);
 	image_barrier(target->commands, &release);
-	if (!check(vkEndCommandBuffer(target->commands), "vkEndCommandBuffer") ||
-	    !check(vkQueueSubmit2(app->queue, 1, &submit, target->done), "vkQueueSubmit2") ||
-	    !check(app->get_semaphore_fd(app->device, &get, &fence), "vkGetSemaphoreFdKHR")) {
+	if (!check(app, vkEndCommandBuffer(target->commands), "vkEndCommandBuffer") ||
+	    !check(app, vkQueueSubmit2(app->queue, 1, &submit, target->done), "vkQueueSubmit2") ||
+	    !check(app, app->get_semaphore_fd(app->device, &get, &fence), "vkGetSemaphoreFdKHR")) {
 		app_quit(app, 1);
 		return;
 	}
@@ -573,8 +574,10 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t time)
 
 static void swapchain_error(struct poor_wl_swapchain *swapchain, int error)
 {
-	log_printf("simple-vulkan: swapchain: %s\n", strerror(error));
-	app_quit(app_of_swapchain(swapchain), 1);
+	struct app *app = app_of_swapchain(swapchain);
+
+	log_printf(&app->log, "simple-vulkan: swapchain: %s\n", strerror(error));
+	app_quit(app, 1);
 }
 
 static const struct poor_wl_swapchain_listener swapchain_listener = {
@@ -659,7 +662,7 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 
 	poor_wl_callback_destroy(callback);
 	if (!app->have_compositor || !app->have_dmabuf || !app->have_syncobj || !app->have_wm_base) {
-		log_printf("simple-vulkan: the compositor has no wl_compositor 4, zwp_linux_dmabuf_v1 4, "
+		log_printf(&app->log, "simple-vulkan: the compositor has no wl_compositor 4, zwp_linux_dmabuf_v1 4, "
 			   "wp_linux_drm_syncobj_manager_v1 or xdg_wm_base\n");
 		app_quit(app, 1);
 		return;
@@ -689,9 +692,10 @@ static void display_error(struct poor_wl_display *display)
 
 	if (error == EPROTO) {
 		code = poor_wl_display_get_protocol_error(display, &interface, &id);
-		log_printf("simple-vulkan: protocol error %u on %s#%u\n", code, interface ? interface->name : "[unknown]", id);
+		log_printf(&app->log, "simple-vulkan: protocol error %u on %s#%u\n", code,
+			   interface ? interface->name : "[unknown]", id);
 	} else {
-		log_printf("simple-vulkan: connection: %s\n", strerror(error));
+		log_printf(&app->log, "simple-vulkan: connection: %s\n", strerror(error));
 	}
 	app_quit(app, 1);
 }
@@ -707,7 +711,7 @@ POOR_LOOP_GROUP_OP(on_signal, loop, file, op, cqe)
 	struct app *app = container_of(file, struct app, signals);
 
 	if (cqe->res == sizeof(app->siginfo))
-		log_printf("simple-vulkan: %s\n", strsignal(app->siginfo.ssi_signo));
+		log_printf(&app->log, "simple-vulkan: %s\n", strsignal(app->siginfo.ssi_signo));
 	sigprocmask(SIG_UNBLOCK, &app->sigset, nullptr);
 	app_quit(app, 0);
 }
@@ -735,13 +739,14 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->drm_fd = app->idle_fd = -1;
 	poor_loop_op_init(&app->open_op, on_open);
 	poor_loop_op_init(&app->idle_op, on_idle);
+	poor_loop_op_init(&app->signal_op, on_signal);
 	app->status = 0;
 	app->width = DEFAULT_WIDTH;
 	app->height = DEFAULT_HEIGHT;
 	app->presented_width = app->presented_height = 0;
 	app->format = 0;
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
-		log_printf("simple-vulkan: can't connect: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-vulkan: can't connect: %s\n", strerror(errno));
 		return -1;
 	}
 	poor_wl_display_get_registry(&app->display, &app->registry);
@@ -755,12 +760,11 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	sigprocmask(SIG_BLOCK, &app->sigset, nullptr);
 	fd = signalfd(-1, &app->sigset, SFD_CLOEXEC);
 	if (fd < 0) {
-		log_printf("simple-vulkan: signalfd: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-vulkan: signalfd: %s\n", strerror(errno));
 		app_quit(app, 1);
 		return 0;
 	}
 	poor_loop_fd_init(&app->signals, fd);
-	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
 	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
 				 array_ptr(&app->siginfo), -1);
@@ -773,10 +777,11 @@ static int app_finish(struct app *app)
 	int ret = 0;
 
 	while (!ret && (!app->signals_closed || (app->swapchain_started && !app->swapchain_closed) || app->open_op.pending ||
-			app->idle_op.pending || log_pending()))
+			app->idle_op.pending || log_pending(&app->log)))
 		ret = poor_loop_run_once(&app->loop);
 	if (!ret)
 		ret = poor_loop_drain(&app->loop, poor_loop_now() + DRAIN_TIMEOUT_NS);
+	log_fini(&app->log);
 	poor_loop_exit(&app->loop);
 	if (ret) {
 		dprintf(STDERR_FILENO, "simple-vulkan: io_uring: %s\n", strerror(-ret));
@@ -787,8 +792,8 @@ static int app_finish(struct app *app)
 
 int main(void)
 {
-	static struct app app;
 	struct io_uring_params params = {};
+	struct app app;
 	int ret;
 
 	ret = poor_loop_init(&app.loop, 64, &params);
@@ -796,8 +801,7 @@ int main(void)
 		dprintf(STDERR_FILENO, "simple-vulkan: io_uring: %s\n", strerror(-ret));
 		return 1;
 	}
-	log_init(&app.loop, "simple-vulkan");
-	poor_wl_log_set_handler_client(log_vprintf);
+	log_init(&app.log, &app.loop);
 	if (app_init(&app) < 0) {
 		app.status = 1;
 		return app_finish(&app);

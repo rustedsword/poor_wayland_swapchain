@@ -27,6 +27,7 @@ struct target {
 struct client {
 	struct poor_wl_display display;
 	struct poor_loop *loop;
+	struct swapchain_server *server;
 	struct poor_wl_registry registry;
 	struct poor_wl_callback callback;
 	struct poor_wl_compositor compositor;
@@ -124,14 +125,14 @@ static void vulkan_stop(struct client *c)
 }
 
 /* Up to half of the format table gets the modifiers that the driver draws 'format' into, then linear */
-static unsigned add_format(struct client *c, uint32_t format, unsigned n)
+static unsigned add_format(struct client *c, struct swapchain_server *server, uint32_t format, unsigned n)
 {
 	VkDrmFormatModifierProperties2EXT driver[64];
 	auto list = xVkDrmFormatModifierPropertiesList2EXT(
 		.drmFormatModifierCount = ARRAY_SIZE(driver),
 		.pDrmFormatModifierProperties = driver,
 	);
-	unsigned end = n + ARRAY_SIZE(swapchain_server.table) / 2 - 1;
+	unsigned end = n + ARRAY_SIZE(server->table) / 2 - 1;
 
 	vkGetPhysicalDeviceFormatProperties2(c->physical, poor_wl_vulkan_format(format), &xVkFormatProperties2(.pNext = &list));
 	foreach_array_const_ref(arrview_first(list.drmFormatModifierCount, driver), listed) {
@@ -140,33 +141,34 @@ static unsigned add_format(struct client *c, uint32_t format, unsigned n)
 		c->ten_bit |= format == DRM_FORMAT_XRGB2101010;
 		if (n == end || listed->drmFormatModifier == DRM_FORMAT_MOD_LINEAR)
 			continue;
-		swapchain_server.table[n].format = format;
-		swapchain_server.table[n].padding = 0;
-		swapchain_server.table[n++].modifier = listed->drmFormatModifier;
+		server->table[n].format = format;
+		server->table[n].padding = 0;
+		server->table[n++].modifier = listed->drmFormatModifier;
 	}
-	swapchain_server.table[n].format = format;
-	swapchain_server.table[n].padding = 0;
-	swapchain_server.table[n++].modifier = DRM_FORMAT_MOD_LINEAR;
+	server->table[n].format = format;
+	server->table[n].padding = 0;
+	server->table[n++].modifier = DRM_FORMAT_MOD_LINEAR;
 	return n;
 }
 
 /* The feedback has the 10 and the 8 bit formats that the driver draws into */
-static void server_config(struct client *c, dev_t device, int syncobj_fd)
+static void server_config(struct client *c, struct swapchain_server *server, dev_t device, int syncobj_fd)
 {
 	unsigned n;
 
 	c->ten_bit = false;
-	n = add_format(c, DRM_FORMAT_XRGB8888, add_format(c, DRM_FORMAT_XRGB2101010, 0));
-	swapchain_server.dmabuf_version = 4;
-	swapchain_server.main_device = device;
-	swapchain_server.entries = n;
-	swapchain_server.tranche_count = 1;
-	swapchain_server.tranches[0].device = device;
-	swapchain_server.tranches[0].flags = 0;
-	swapchain_server.tranches[0].count = n;
-	foreach_array_index(arrview_first(n, swapchain_server.tranches[0].indices), i)
-		swapchain_server.tranches[0].indices[i] = i;
-	swapchain_server.syncobj_fd = syncobj_fd;
+	n = add_format(c, server, DRM_FORMAT_XRGB8888, add_format(c, server, DRM_FORMAT_XRGB2101010, 0));
+	server->dmabuf_version = 4;
+	server->main_device = device;
+	server->entries = n;
+	server->tranche_count = 1;
+	server->tranches[0].device = device;
+	server->tranches[0].flags = 0;
+	server->tranches[0].count = n;
+	foreach_array_index(arrview_first(n, server->tranches[0].indices), i)
+		server->tranches[0].indices[i] = i;
+	server->syncobj_fd = syncobj_fd;
+	server->hold_releases = false;
 }
 
 static struct target *target_of(struct client *c, struct poor_wl_swapchain_buffer *buffer)
@@ -389,13 +391,14 @@ static void client_done(struct poor_wl_display *display)
 	container_of(display, struct client, display)->done = true;
 }
 
-static void client_start(struct client *c, int syncobj_fd)
+static void client_start(struct client *c, struct swapchain_server *server, int syncobj_fd)
 {
 	struct poor_wl_connection_memory memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);
 
+	c->server = server;
 	c->frames = c->max_frames = c->allocations = c->frees = c->partial_frames = 0;
 	c->synced = c->done = c->error_called = c->swapchain_done = false;
-	poor_wl_display_connect_to_fd(&c->display, c->loop, &memory, swapchain_server_connect(), client_error, client_done);
+	poor_wl_display_connect_to_fd(&c->display, c->loop, &memory, swapchain_server_connect(server), client_error, client_done);
 	poor_wl_display_get_registry(&c->display, &c->registry);
 	poor_wl_registry_add_listener(&c->registry, &registry_listener, c);
 	client_roundtrip(c);
@@ -414,20 +417,20 @@ static void client_stop(struct client *c)
 	poor_wl_surface_destroy(&c->surface);
 	client_roundtrip(c);
 	run_until(c->loop, c->swapchain_done);
-	assert(c->frees == c->allocations && swapchain_server.buffers_destroyed == swapchain_server.buffers_created);
+	assert(c->frees == c->allocations && c->server->buffers_destroyed == c->server->buffers_created);
 	poor_wl_display_disconnect(&c->display);
 	run_until(c->loop, c->done);
 }
 
 static void client_present(struct client *c, int32_t width, int32_t height, unsigned frames)
 {
-	unsigned commits = swapchain_server.commits;
+	unsigned commits = c->server->commits;
 
 	c->max_frames = c->frames + frames;
 	poor_wl_swapchain_resize(&c->swapchain, width, height);
 	poor_wl_swapchain_request_frame(&c->swapchain);
-	run_until(c->loop, swapchain_server.commits == commits + frames);
-	assert(c->frames == c->max_frames && swapchain_server.width == width && swapchain_server.height == height);
+	run_until(c->loop, c->server->commits == commits + frames);
+	assert(c->frames == c->max_frames && c->server->width == width && c->server->height == height);
 }
 
 /*
@@ -438,34 +441,36 @@ static void client_present(struct client *c, int32_t width, int32_t height, unsi
  */
 TEST(vulkan_frames)
 {
-	static struct client c;
-	struct poor_loop loop;
 	dev_t device = makedev(226, 128);
+	struct poor_loop_timer watchdog;
+	struct swapchain_server server;
+	struct poor_loop loop;
+	struct client c;
 	int fd, fds;
 
-	loop_init(&loop);
+	loop_init(&loop, &watchdog);
 	c.loop = &loop;
 	fd = render_node_open(&loop);
 	if (fd < 0 || !vulkan_start(&c, device)) {
 		if (fd >= 0)
 			poor_loop_close_fd_or_submit(&loop, fd, 0);
-		loop_fini(&loop);
+		loop_fini(&loop, &watchdog);
 		return;
 	}
 	DISABLE_LEAK_CHECKS;
 	fds = count_open_fds();
-	server_config(&c, device, fd);
-	swapchain_server_start(&loop);
-	client_start(&c, fd);
+	server_config(&c, &server, device, fd);
+	swapchain_server_start(&server, &loop);
+	client_start(&c, &server, fd);
 	client_present(&c, 64, 32, 10);
 	client_present(&c, 96, 64, 10);
-	assert(swapchain_server.acquires == 20 && swapchain_server.planes >= 1 && c.allocations >= 2 && c.partial_frames);
-	assert(swapchain_server.format == (c.ten_bit ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888));
+	assert(server.acquires == 20 && server.planes >= 1 && c.allocations >= 2 && c.partial_frames);
+	assert(server.format == (c.ten_bit ? DRM_FORMAT_XRGB2101010 : DRM_FORMAT_XRGB8888));
 	client_stop(&c);
-	swapchain_server_stop();
-	run_until(&loop, swapchain_server.display_done);
+	swapchain_server_stop(&server);
+	run_until(&loop, server.display_done);
 	poor_loop_close_fd_or_submit(&loop, fd, 0);
-	loop_fini(&loop);
+	loop_fini(&loop, &watchdog);
 	assert(count_open_fds() == fds - 2);
 	vulkan_stop(&c);
 }

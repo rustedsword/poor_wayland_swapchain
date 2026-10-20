@@ -62,6 +62,7 @@ struct target {
 
 struct app {
 	struct poor_loop loop;
+	struct example_log log;
 	struct poor_wl_display display;
 	struct poor_wl_registry registry;
 	struct poor_wl_callback sync;
@@ -199,7 +200,7 @@ static const struct poor_wl_swapchain_allocator allocator = {
 	.free = free_buffer,
 };
 
-static GLuint shader_compile(GLenum type, const char *source)
+static GLuint shader_compile(struct app *app, GLenum type, const char *source)
 {
 	GLuint shader = glCreateShader(type);
 	char info[512];
@@ -210,7 +211,7 @@ static GLuint shader_compile(GLenum type, const char *source)
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
 	if (!ok) {
 		glGetShaderInfoLog(shader, ARRAY_SIZE(info), nullptr, info);
-		log_printf("simple-egl: shader: %s\n", info);
+		log_printf(&app->log, "simple-egl: shader: %s\n", info);
 		glDeleteShader(shader);
 		return 0;
 	}
@@ -219,8 +220,8 @@ static GLuint shader_compile(GLenum type, const char *source)
 
 static bool program_init(struct app *app)
 {
-	GLuint vertex = shader_compile(GL_VERTEX_SHADER, vertex_source);
-	GLuint fragment = shader_compile(GL_FRAGMENT_SHADER, fragment_source);
+	GLuint vertex = shader_compile(app, GL_VERTEX_SHADER, vertex_source);
+	GLuint fragment = shader_compile(app, GL_FRAGMENT_SHADER, fragment_source);
 	GLint ok = 0;
 
 	if (vertex && fragment) {
@@ -273,22 +274,22 @@ static void gbm_ready(struct poor_wl_gbm *gbm)
 	int ret;
 
 	if (gbm->error) {
-		log_printf("simple-egl: can't open the GPU of the compositor: %s\n", strerror(gbm->error));
+		log_printf(&app->log, "simple-egl: can't open the GPU of the compositor: %s\n", strerror(gbm->error));
 		app_quit(app, 1);
 		return;
 	}
 	if (!egl_init(app)) {
-		log_printf("simple-egl: EGL setup failed: %#x\n", eglGetError());
+		log_printf(&app->log, "simple-egl: EGL setup failed: %#x\n", eglGetError());
 		app_quit(app, 1);
 		return;
 	}
 	if (app->have_syncobj && app->create_sync && app->destroy_sync && app->dup_fence) {
 		ret = poor_wl_swapchain_set_syncobj(&app->swapchain, &app->syncobj, gbm->fd);
 		if (ret < 0)
-			log_printf("simple-egl: no explicit synchronization: %s\n", strerror(-ret));
+			log_printf(&app->log, "simple-egl: no explicit synchronization: %s\n", strerror(-ret));
 		app->explicit_sync = !ret;
 	}
-	log_printf("simple-egl: %s synchronization\n", app->explicit_sync ? "explicit" : "implicit");
+	log_printf(&app->log, "simple-egl: %s synchronization\n", app->explicit_sync ? "explicit" : "implicit");
 	poor_wl_swapchain_set_allocator(&app->swapchain, &allocator, app);
 }
 
@@ -302,12 +303,12 @@ static void swapchain_device(struct poor_wl_swapchain *swapchain, dev_t device)
 	struct app *app = app_of_swapchain(swapchain);
 
 	if (app->gbm_open) {
-		log_printf("simple-egl: the compositor moved to another GPU\n");
+		log_printf(&app->log, "simple-egl: the compositor moved to another GPU\n");
 		app_quit(app, 1);
 		return;
 	}
 	if (poor_wl_gbm_open(&app->gbm, &app->loop, device, gbm_ready, gbm_done) < 0) {
-		log_printf("simple-egl: the compositor's device is no GPU: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-egl: the compositor's device is no GPU: %s\n", strerror(errno));
 		app_quit(app, 1);
 		return;
 	}
@@ -352,8 +353,10 @@ static void swapchain_frame(struct poor_wl_swapchain *swapchain, uint32_t time)
 
 static void swapchain_error(struct poor_wl_swapchain *swapchain, int error)
 {
-	log_printf("simple-egl: swapchain: %s\n", strerror(error));
-	app_quit(app_of_swapchain(swapchain), 1);
+	struct app *app = app_of_swapchain(swapchain);
+
+	log_printf(&app->log, "simple-egl: swapchain: %s\n", strerror(error));
+	app_quit(app, 1);
 }
 
 static const struct poor_wl_swapchain_listener swapchain_listener = {
@@ -438,7 +441,8 @@ static void synced(void *data, struct poor_wl_callback *callback, uint32_t)
 
 	poor_wl_callback_destroy(callback);
 	if (!app->have_compositor || !app->have_dmabuf || !app->have_wm_base) {
-		log_printf("simple-egl: the compositor has no wl_compositor 4, zwp_linux_dmabuf_v1 4 or xdg_wm_base\n");
+		log_printf(&app->log, "simple-egl: the compositor has no wl_compositor 4, zwp_linux_dmabuf_v1 4 or "
+			   "xdg_wm_base\n");
 		app_quit(app, 1);
 		return;
 	}
@@ -468,9 +472,10 @@ static void display_error(struct poor_wl_display *display)
 
 	if (error == EPROTO) {
 		code = poor_wl_display_get_protocol_error(display, &interface, &id);
-		log_printf("simple-egl: protocol error %u on %s#%u\n", code, interface ? interface->name : "[unknown]", id);
+		log_printf(&app->log, "simple-egl: protocol error %u on %s#%u\n", code,
+			   interface ? interface->name : "[unknown]", id);
 	} else {
-		log_printf("simple-egl: connection: %s\n", strerror(error));
+		log_printf(&app->log, "simple-egl: connection: %s\n", strerror(error));
 	}
 	app_quit(app, 1);
 }
@@ -486,7 +491,7 @@ POOR_LOOP_GROUP_OP(on_signal, loop, file, op, cqe)
 	struct app *app = container_of(file, struct app, signals);
 
 	if (cqe->res == sizeof(app->siginfo))
-		log_printf("simple-egl: %s\n", strsignal(app->siginfo.ssi_signo));
+		log_printf(&app->log, "simple-egl: %s\n", strsignal(app->siginfo.ssi_signo));
 	sigprocmask(SIG_UNBLOCK, &app->sigset, nullptr);
 	app_quit(app, 0);
 }
@@ -505,6 +510,7 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->swapchain_started = app->swapchain_closed = app->gbm_open = app->closing = false;
 	app->gbm_closed = false;
 	app->signals_closed = true;
+	poor_loop_op_init(&app->signal_op, on_signal);
 	app->egl_display = EGL_NO_DISPLAY;
 	app->egl_context = EGL_NO_CONTEXT;
 	app->create_sync = nullptr;
@@ -515,7 +521,7 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	app->width = DEFAULT_WIDTH;
 	app->height = DEFAULT_HEIGHT;
 	if (poor_wl_display_connect(&app->display, &app->loop, &memory, nullptr, display_error, display_done) < 0) {
-		log_printf("simple-egl: can't connect: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-egl: can't connect: %s\n", strerror(errno));
 		return -1;
 	}
 	poor_wl_display_get_registry(&app->display, &app->registry);
@@ -529,12 +535,11 @@ POOR_LOOP_FD_DONE(signal_file, loop, file)
 	sigprocmask(SIG_BLOCK, &app->sigset, nullptr);
 	fd = signalfd(-1, &app->sigset, SFD_CLOEXEC);
 	if (fd < 0) {
-		log_printf("simple-egl: signalfd: %s\n", strerror(errno));
+		log_printf(&app->log, "simple-egl: signalfd: %s\n", strerror(errno));
 		app_quit(app, 1);
 		return 0;
 	}
 	poor_loop_fd_init(&app->signals, fd);
-	poor_loop_op_init(&app->signal_op, on_signal);
 	app->signals_closed = false;
 	io_uring_prep_read_array(need_sqe(poor_loop_group_get_sqe_or_submit(&app->loop, &app->signals, &app->signal_op)), fd,
 				 array_ptr(&app->siginfo), -1);
@@ -547,10 +552,11 @@ static int app_finish(struct app *app)
 	int ret = 0;
 
 	while (!ret && (!app->signals_closed || (app->swapchain_started && !app->swapchain_closed) ||
-			(app->gbm_open && !app->gbm_closed) || log_pending()))
+			(app->gbm_open && !app->gbm_closed) || log_pending(&app->log)))
 		ret = poor_loop_run_once(&app->loop);
 	if (!ret)
 		ret = poor_loop_drain(&app->loop, poor_loop_now() + DRAIN_TIMEOUT_NS);
+	log_fini(&app->log);
 	poor_loop_exit(&app->loop);
 	if (ret) {
 		dprintf(STDERR_FILENO, "simple-egl: io_uring: %s\n", strerror(-ret));
@@ -561,8 +567,8 @@ static int app_finish(struct app *app)
 
 int main(void)
 {
-	static struct app app;
 	struct io_uring_params params = {};
+	struct app app;
 	int ret;
 
 	ret = poor_loop_init(&app.loop, 64, &params);
@@ -570,8 +576,7 @@ int main(void)
 		dprintf(STDERR_FILENO, "simple-egl: io_uring: %s\n", strerror(-ret));
 		return 1;
 	}
-	log_init(&app.loop, "simple-egl");
-	poor_wl_log_set_handler_client(log_vprintf);
+	log_init(&app.log, &app.loop);
 	if (app_init(&app) < 0) {
 		app.status = 1;
 		return app_finish(&app);

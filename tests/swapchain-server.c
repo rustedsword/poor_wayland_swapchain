@@ -18,17 +18,10 @@
 #include "poor_wayland_server.h"
 #include "swapchain-server.h"
 
-constexpr unsigned MAX_CLIENTS = 4;
 constexpr unsigned MAX_FRAMES = 4;
 
-struct test_client {
-	struct poor_wl_client client;
-	bool used;
-	char in[16384];
-	char out[16384];
-	union poor_wl_map_entry objects[64];
-	union poor_wl_map_entry server_objects[16];
-};
+static_assert(sizeof(struct poor_wl_display) <= sizeof(struct swapchain_server_display) &&
+	      alignof(struct poor_wl_display) <= alignof(struct swapchain_server_display));
 
 struct surface;
 
@@ -55,7 +48,7 @@ struct surface {
 	struct surface_sync *sync;
 	struct frame *frames[MAX_FRAMES];
 	unsigned frame_count;
-	struct swapchain_server_rect damage[ARRAY_SIZE(swapchain_server.damage)];
+	typeof(((struct swapchain_server *)nullptr)->damage) damage;
 	unsigned damage_count;
 };
 
@@ -84,20 +77,20 @@ struct feedback {
 	struct poor_wl_list link;
 };
 
-struct swapchain_server_state swapchain_server;
+static struct poor_wl_display *display_of(struct swapchain_server *server)
+{
+	return (struct poor_wl_display *)&server->display;
+}
 
-static struct {
-	struct poor_loop *loop;
-	struct poor_wl_display display;
-	struct poor_wl_global compositor, dmabuf, syncobj;
-	struct poor_wl_list feedbacks;
-	struct test_client clients[MAX_CLIENTS];
-	struct {
-		uint32_t syncobj;
-		uint64_t point;
-	} held[8];
-	unsigned held_count;
-} server;
+static struct swapchain_server *server_of_display(struct poor_wl_display *display)
+{
+	return container_of((struct swapchain_server_display *)display, struct swapchain_server, display);
+}
+
+static struct swapchain_server *server_of(struct poor_wl_client *client)
+{
+	return server_of_display(poor_wl_client_get_display(client));
+}
 
 static void *server_alloc(struct poor_wl_display *, struct poor_wl_client *, size_t size)
 {
@@ -114,13 +107,13 @@ static void free_resource(struct poor_wl_resource *resource)
 	free(resource);
 }
 
-static void syncobj_ioctl(unsigned long request, void *arg)
+static void syncobj_ioctl(struct swapchain_server *server, unsigned long request, void *arg)
 {
-	assert(swapchain_server.syncobj_fd >= 0 && !ioctl(swapchain_server.syncobj_fd, request, arg));
+	assert(server->syncobj_fd >= 0 && !ioctl(server->syncobj_fd, request, arg));
 }
 
 /* The last point with a fence, which may still be pending */
-static uint64_t syncobj_last_point(uint32_t syncobj)
+static uint64_t syncobj_last_point(struct swapchain_server *server, uint32_t syncobj)
 {
 	uint64_t point;
 	struct drm_syncobj_timeline_array query = {
@@ -128,17 +121,17 @@ static uint64_t syncobj_last_point(uint32_t syncobj)
 		.flags = DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED
 	};
 
-	syncobj_ioctl(DRM_IOCTL_SYNCOBJ_QUERY, &query);
+	syncobj_ioctl(server, DRM_IOCTL_SYNCOBJ_QUERY, &query);
 	return point;
 }
 
-static void syncobj_signal(uint32_t syncobj, uint64_t point)
+static void syncobj_signal(struct swapchain_server *server, uint32_t syncobj, uint64_t point)
 {
 	struct drm_syncobj_timeline_array signal = {
 		.handles = (uintptr_t)&syncobj, .points = (uintptr_t)&point, .count_handles = 1
 	};
 
-	syncobj_ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &signal);
+	syncobj_ioctl(server, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &signal);
 }
 
 static void buffer_destroy_request(struct poor_wl_client *, struct poor_wl_buffer_resource *resource)
@@ -158,7 +151,7 @@ static void buffer_destroy(struct poor_wl_resource *resource)
 		buffer->pending_on->pending = nullptr;
 	if (buffer->current_on)
 		buffer->current_on->current = nullptr;
-	swapchain_server.buffers_destroyed++;
+	server_of(poor_wl_resource_get_client(resource))->buffers_destroyed++;
 	free(buffer);
 }
 
@@ -224,70 +217,71 @@ static void surface_frame(struct poor_wl_client *client, struct poor_wl_surface_
 	surface->frames[surface->frame_count++] = frame;
 }
 
-static void release_point(uint32_t syncobj, uint64_t point)
+static void release_point(struct swapchain_server *server, uint32_t syncobj, uint64_t point)
 {
-	if (!swapchain_server.hold_releases) {
-		syncobj_signal(syncobj, point);
+	if (!server->hold_releases) {
+		syncobj_signal(server, syncobj, point);
 		return;
 	}
-	assert(server.held_count < ARRAY_SIZE(server.held));
-	server.held[server.held_count].syncobj = syncobj;
-	server.held[server.held_count++].point = point;
+	assert(server->held_count < ARRAY_SIZE(server->held));
+	server->held[server->held_count].syncobj = syncobj;
+	server->held[server->held_count++].point = point;
 }
 
 /* By the commit the rendering of the buffer has a fence on the acquire point, which may still be pending */
-static void surface_sync_commit(struct surface_sync *sync, struct buffer *buffer)
+static void surface_sync_commit(struct swapchain_server *server, struct surface_sync *sync, struct buffer *buffer)
 {
 	assert(!buffer == !sync->acquire && !buffer == !sync->release);
 	if (!buffer)
 		return;
 	assert(sync->acquire != sync->release || sync->acquire_point < sync->release_point);
-	assert(syncobj_last_point(sync->acquire->syncobj) >= sync->acquire_point);
+	assert(syncobj_last_point(server, sync->acquire->syncobj) >= sync->acquire_point);
 	buffer->release_syncobj = sync->release->syncobj;
 	buffer->release_point = sync->release_point;
-	swapchain_server.acquires++;
-	swapchain_server.acquire_point = sync->acquire_point;
-	swapchain_server.release_point = sync->release_point;
+	server->acquires++;
+	server->acquire_point = sync->acquire_point;
+	server->release_point = sync->release_point;
 	sync->acquire = sync->release = nullptr;
 }
 
 /* The buffer is shown right away: the previous one is released and the frame callbacks are done */
-static void surface_commit(struct poor_wl_client *, struct poor_wl_surface_resource *resource)
+static void surface_commit(struct poor_wl_client *client, struct poor_wl_surface_resource *resource)
 {
 	struct surface *surface = container_of(resource, struct surface, resource);
+	struct swapchain_server *server = server_of(client);
 	struct buffer *buffer = surface->pending;
 	auto frames = arrview_first(surface->frame_count, surface->frames);
 
-	swapchain_server.commits++;
+	server->commits++;
 	if (surface->sync)
-		surface_sync_commit(surface->sync, buffer);
+		surface_sync_commit(server, surface->sync, buffer);
 	if (buffer) {
 		surface->pending = nullptr;
 		buffer->pending_on = nullptr;
 		if (surface->current && surface->current != buffer) {
 			if (surface->sync)
-				release_point(surface->current->release_syncobj, surface->current->release_point);
+				release_point(server, surface->current->release_syncobj, surface->current->release_point);
 			else
 				poor_wl_buffer_send_release(&surface->current->resource);
 			surface->current->current_on = nullptr;
 		}
 		surface->current = buffer;
 		buffer->current_on = surface;
-		swapchain_server.width = buffer->width;
-		swapchain_server.height = buffer->height;
-		swapchain_server.format = buffer->format;
-		swapchain_server.stride = buffer->stride;
-		swapchain_server.modifier = buffer->modifier;
-		swapchain_server.planes = buffer->planes;
-		swapchain_server.sampling_device = buffer->sampling_device;
+		server->width = buffer->width;
+		server->height = buffer->height;
+		server->format = buffer->format;
+		server->stride = buffer->stride;
+		server->modifier = buffer->modifier;
+		server->planes = buffer->planes;
+		server->sampling_device = buffer->sampling_device;
 	}
-	copy_array(swapchain_server.damage, arrview_first(surface->damage_count, surface->damage));
-	swapchain_server.damage_count = surface->damage_count;
+	copy_array(server->damage, arrview_first(surface->damage_count, surface->damage));
+	server->damage_count = surface->damage_count;
 	surface->damage_count = 0;
 	surface->frame_count = 0;
 	foreach_array_const_ref(frames, frame) {
 		(*frame)->surface = nullptr;
-		poor_wl_callback_send_done(&(*frame)->resource, swapchain_server.commits);
+		poor_wl_callback_send_done(&(*frame)->resource, server->commits);
 		poor_wl_resource_destroy(&(*frame)->resource.resource);
 	}
 }
@@ -354,12 +348,12 @@ static void params_destroy_request(struct poor_wl_client *, struct poor_zwp_linu
 	poor_wl_resource_destroy(&resource->resource);
 }
 
-static void params_add(struct poor_wl_client *, struct poor_zwp_linux_buffer_params_v1_resource *resource, int32_t fd, uint32_t plane,
-		       uint32_t, uint32_t stride, uint32_t modifier_hi, uint32_t modifier_lo)
+static void params_add(struct poor_wl_client *client, struct poor_zwp_linux_buffer_params_v1_resource *resource, int32_t fd,
+		       uint32_t plane, uint32_t, uint32_t stride, uint32_t modifier_hi, uint32_t modifier_lo)
 {
 	struct params *params = container_of(resource, struct params, resource);
 
-	poor_loop_close_fd_or_submit(server.loop, fd, 0);
+	poor_loop_close_fd_or_submit(server_of(client)->loop, fd, 0);
 	if (!plane)
 		params->stride = stride;
 	params->planes++;
@@ -387,7 +381,7 @@ static void params_create_immed(struct poor_wl_client *client, struct poor_zwp_l
 	buffer->modifier = params->modifier;
 	buffer->planes = params->planes;
 	buffer->sampling_device = params->sampling_device;
-	swapchain_server.buffers_created++;
+	server_of(client)->buffers_created++;
 }
 
 static void params_set_sampling_device(struct poor_wl_client *, struct poor_zwp_linux_buffer_params_v1_resource *resource,
@@ -430,9 +424,9 @@ static void send_device(struct poor_wl_array *array, dev_t device)
 }
 
 /* Version 6 has no main device */
-static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *feedback)
+static void send_feedback(struct swapchain_server *server, struct poor_zwp_linux_dmabuf_feedback_v1_resource *feedback)
 {
-	auto table = arrview_first(swapchain_server.entries, swapchain_server.table);
+	auto table = arrview_first(server->entries, server->table);
 	int fd = memfd_create("swapchain-server", MFD_CLOEXEC);
 	char storage[64];
 	struct poor_wl_array array = POOR_WL_ARRAY_INIT(storage);
@@ -440,10 +434,10 @@ static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *fee
 	assert(fd >= 0 && write_array(fd, table) == (ssize_t)ARRAY_SIZE_BYTES(table));
 	poor_zwp_linux_dmabuf_feedback_v1_send_format_table(feedback, fd, ARRAY_SIZE_BYTES(table));
 	if (poor_wl_resource_get_version(&feedback->resource) < 6) {
-		send_device(&array, swapchain_server.main_device);
+		send_device(&array, server->main_device);
 		poor_zwp_linux_dmabuf_feedback_v1_send_main_device(feedback, &array);
 	}
-	foreach_array_const_ref(arrview_first(swapchain_server.tranche_count, swapchain_server.tranches), tranche) {
+	foreach_array_const_ref(arrview_first(server->tranche_count, server->tranches), tranche) {
 		auto indices = arrview_first(tranche->count, tranche->indices);
 
 		send_device(&array, tranche->device);
@@ -455,11 +449,12 @@ static void send_feedback(struct poor_zwp_linux_dmabuf_feedback_v1_resource *fee
 		poor_zwp_linux_dmabuf_feedback_v1_send_tranche_done(feedback);
 	}
 	poor_zwp_linux_dmabuf_feedback_v1_send_done(feedback);
-	swapchain_server.feedbacks++;
+	server->feedbacks++;
 }
 
 static void feedback_new(struct poor_wl_client *client, struct poor_zwp_linux_dmabuf_v1_resource *resource, uint32_t id)
 {
+	struct swapchain_server *server = server_of(client);
 	struct feedback *feedback = malloc(sizeof(*feedback));
 
 	assert(feedback);
@@ -470,8 +465,8 @@ static void feedback_new(struct poor_wl_client *client, struct poor_zwp_linux_dm
 		return;
 	}
 	poor_zwp_linux_dmabuf_feedback_v1_resource_set_implementation(&feedback->resource, &feedback_impl, nullptr, feedback_destroy);
-	poor_wl_list_insert(&server.feedbacks, &feedback->link);
-	send_feedback(&feedback->resource);
+	poor_wl_list_insert(&server->feedback_list, &feedback->link);
+	send_feedback(server, &feedback->resource);
 }
 
 static void dmabuf_destroy_request(struct poor_wl_client *, struct poor_zwp_linux_dmabuf_v1_resource *resource)
@@ -542,7 +537,7 @@ static void timeline_destroy(struct poor_wl_resource *resource)
 	struct timeline *timeline = container_of(resource, struct timeline, resource.resource);
 	struct drm_syncobj_destroy destroy = { .handle = timeline->syncobj };
 
-	syncobj_ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+	syncobj_ioctl(server_of(poor_wl_resource_get_client(resource)), DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
 	free(timeline);
 }
 
@@ -615,12 +610,13 @@ static void syncobj_get_surface(struct poor_wl_client *client, struct poor_wp_li
 static void syncobj_import_timeline(struct poor_wl_client *client, struct poor_wp_linux_drm_syncobj_manager_v1_resource *,
 				    uint32_t id, int32_t fd)
 {
+	struct swapchain_server *server = server_of(client);
 	struct timeline *timeline = malloc(sizeof(*timeline));
 	struct drm_syncobj_handle import = { .fd = fd };
 
 	assert(timeline);
-	syncobj_ioctl(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import);
-	poor_loop_close_fd_or_submit(server.loop, fd, 0);
+	syncobj_ioctl(server, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import);
+	poor_loop_close_fd_or_submit(server->loop, fd, 0);
 	if (poor_wp_linux_drm_syncobj_timeline_v1_resource_init(&timeline->resource, client, 1, id) < 0) {
 		free(timeline);
 		poor_wl_client_post_no_memory(client);
@@ -652,17 +648,17 @@ static void bind_syncobj(struct poor_wl_client *client, void *, uint32_t version
 
 static void client_done(struct poor_wl_client *client)
 {
-	container_of(client, struct test_client, client)->used = false;
-	swapchain_server.clients_done++;
+	container_of(client, struct swapchain_server_client, client)->used = false;
+	server_of(client)->clients_done++;
 }
 
-int swapchain_server_connect(void)
+int swapchain_server_connect(struct swapchain_server *server)
 {
+	struct swapchain_server_client *c = nullptr;
 	struct poor_wl_connection_memory memory;
-	struct test_client *c = nullptr;
 	int fds[2];
 
-	foreach_array_ref(server.clients, client) {
+	foreach_array_ref(server->clients, client) {
 		if (!client->used) {
 			c = client;
 			break;
@@ -671,45 +667,51 @@ int swapchain_server_connect(void)
 	assert(c && !socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
 	c->used = true;
 	memory = POOR_WL_CONNECTION_MEMORY(c->in, c->out, c->objects, c->server_objects);
-	poor_wl_client_init(&c->client, &server.display, fds[0], &memory, client_done);
+	poor_wl_client_init(&c->client, display_of(server), fds[0], &memory, client_done);
 	return fds[1];
 }
 
-static void display_done(struct poor_wl_display *)
+static void display_done(struct poor_wl_display *display)
 {
-	swapchain_server.display_done = true;
+	server_of_display(display)->display_done = true;
 }
 
-void swapchain_server_start(struct poor_loop *loop)
+void swapchain_server_start(struct swapchain_server *server, struct poor_loop *loop)
 {
-	server.loop = loop;
-	server.held_count = 0;
-	poor_wl_list_init(&server.feedbacks);
-	poor_wl_display_init(&server.display, loop, display_done);
-	poor_wl_display_set_allocator(&server.display, server_alloc, server_free);
-	poor_wl_global_init(&server.compositor, &server.display, &poor_wl_compositor_interface, 4, nullptr, bind_compositor);
-	poor_wl_global_init(&server.dmabuf, &server.display, &poor_zwp_linux_dmabuf_v1_interface, swapchain_server.dmabuf_version,
-			    nullptr, bind_dmabuf);
-	poor_wl_global_init(&server.syncobj, &server.display, &poor_wp_linux_drm_syncobj_manager_v1_interface, 1, nullptr,
-			    bind_syncobj);
+	struct poor_wl_display *display = display_of(server);
+
+	server->buffers_created = server->buffers_destroyed = server->commits = server->feedbacks = server->clients_done = 0;
+	server->acquires = 0;
+	server->display_done = false;
+	server->loop = loop;
+	foreach_array_ref(server->clients, client)
+		client->used = false;
+	server->held_count = 0;
+	poor_wl_list_init(&server->feedback_list);
+	poor_wl_display_init(display, loop, display_done);
+	poor_wl_display_set_allocator(display, server_alloc, server_free);
+	poor_wl_global_init(&server->compositor, display, &poor_wl_compositor_interface, 4, nullptr, bind_compositor);
+	poor_wl_global_init(&server->dmabuf, display, &poor_zwp_linux_dmabuf_v1_interface, server->dmabuf_version, nullptr,
+			    bind_dmabuf);
+	poor_wl_global_init(&server->syncobj, display, &poor_wp_linux_drm_syncobj_manager_v1_interface, 1, nullptr, bind_syncobj);
 }
 
-void swapchain_server_send_feedback(void)
+void swapchain_server_send_feedback(struct swapchain_server *server)
 {
 	struct feedback *feedback;
 
-	poor_wl_list_for_each(feedback, &server.feedbacks, link)
-		send_feedback(&feedback->resource);
+	poor_wl_list_for_each(feedback, &server->feedback_list, link)
+		send_feedback(server, &feedback->resource);
 }
 
-void swapchain_server_stop(void)
+void swapchain_server_stop(struct swapchain_server *server)
 {
-	poor_wl_display_destroy(&server.display);
+	poor_wl_display_destroy(display_of(server));
 }
 
-void swapchain_server_release_held(void)
+void swapchain_server_release_held(struct swapchain_server *server)
 {
-	foreach_array_const_ref(arrview_first(server.held_count, server.held), held)
-		syncobj_signal(held->syncobj, held->point);
-	server.held_count = 0;
+	foreach_array_const_ref(arrview_first(server->held_count, server->held), held)
+		syncobj_signal(server, held->syncobj, held->point);
+	server->held_count = 0;
 }
