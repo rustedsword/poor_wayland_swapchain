@@ -265,7 +265,7 @@ static VkResult image_export(struct poor_wl_vulkan *vulkan, struct poor_wl_vulka
 		result = vulkan->get_memory_fd(vulkan->device, &get, &buffer->planes[i].fd);
 		if (result != VK_SUCCESS) {
 			foreach_array_const_ref(arrview_first(i, buffer->planes), plane)
-				poor_loop_close_fd_or_submit(vulkan->loop, plane->fd, 0);
+				poor_loop_close_fd_or_submit(vulkan->loop, plane->fd, IOSQE_ASYNC);
 			return result;
 		}
 		vulkan->get_subresource_layout(vulkan->device, image->image, &subresource, &layout);

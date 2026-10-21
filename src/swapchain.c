@@ -258,6 +258,7 @@ POOR_LOOP_GROUP_DONE(poor_wl_swapchain_io, loop, io)
 {
 	struct poor_wl_swapchain *swapchain = swapchain_of(io);
 
+	/* IOSQE_ASYNC is not set here, because: an eventfd is cheap to release */
 	if (swapchain->eventfd >= 0)
 		poor_loop_close_fd_or_submit(loop, swapchain->eventfd, 0);
 	swapchain->listener->done(swapchain);
@@ -307,7 +308,7 @@ static int buffer_allocate(struct poor_wl_swapchain *swapchain, struct poor_wl_s
 	buffer->allocator_data = swapchain->allocator_data;
 	if (swapchain->syncobj_manager && (ret = buffer_timeline_init(swapchain, buffer)) < 0) {
 		foreach_array_const_ref(planes, plane)
-			poor_loop_close_fd_or_submit(swapchain->loop, plane->fd, 0);
+			poor_loop_close_fd_or_submit(swapchain->loop, plane->fd, IOSQE_ASYNC);
 		buffer->allocator->free(buffer->allocator_data, buffer);
 		return ret;
 	}
@@ -472,7 +473,7 @@ static void feedback_format_table(void *data, struct poor_zwp_linux_dmabuf_feedb
 	struct poor_wl_swapchain *swapchain = data;
 	void *table = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
 
-	poor_loop_close_fd_or_submit(swapchain->loop, fd, 0);
+	poor_loop_close_fd_or_submit(swapchain->loop, fd, IOSQE_ASYNC);
 	if (table == MAP_FAILED) {
 		swapchain_fail(swapchain, errno);
 		return;
@@ -677,6 +678,7 @@ POOR_WL_EXPORT void poor_wl_swapchain_present_damage_impl(struct poor_wl_swapcha
 	swapchain->rendering = nullptr;
 	if (swapchain->syncobj_manager)
 		ret = buffer_set_points(swapchain, buffer, fence);
+	/* IOSQE_ASYNC is not set here, because: a sync file is cheap to release, io-wq would add a wakeup every frame */
 	if (fence >= 0)
 		poor_loop_close_fd_or_submit(swapchain->loop, fence, 0);
 	if (ret < 0) {

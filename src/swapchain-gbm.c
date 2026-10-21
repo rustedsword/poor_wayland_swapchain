@@ -106,7 +106,7 @@ POOR_LOOP_GROUP_DONE(poor_wl_gbm_io, loop, io)
 	struct poor_wl_gbm *gbm = gbm_of(io);
 
 	if (gbm->fd >= 0)
-		poor_loop_close_fd_or_submit(loop, gbm->fd, 0);
+		poor_loop_close_fd_or_submit(loop, gbm->fd, IOSQE_ASYNC);
 	gbm->done(gbm);
 }
 
@@ -190,7 +190,7 @@ static int gbm_allocate(void *data, struct poor_wl_swapchain_buffer *buffer, uin
 		if (buffer->planes[i].fd < 0) {
 			ret = -errno;
 			foreach_array_const_ref(arrview_first(i, buffer->planes), plane)
-				poor_loop_close_fd_or_submit(gbm->loop, plane->fd, 0);
+				poor_loop_close_fd_or_submit(gbm->loop, plane->fd, IOSQE_ASYNC);
 			gbm_bo_destroy(bo);
 			return ret;
 		}
